@@ -24,6 +24,10 @@ use node::{CONFIRMATIONS, Cmd, Node, NodeConfig, NodeState, WalletUtxo};
 use wallet::{SentTx, Wallet, data_dir, format_aero, parse_aero, required_fee, unix_now};
 
 const APP_NAME: &str = "Aero Core";
+/// The Aero logo (a circle with transparent corners), used as the window icon and in the About dialog.
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+/// The teal of the Aero logo, used for selections and highlights.
+const ACCENT: Color32 = Color32::from_rgb(0, 150, 140);
 const UNIT: &str = "ARO";
 /// How long an output we just spent stays excluded from new payments, while the node catches up.
 const SPENT_HOLD: Duration = Duration::from_secs(120);
@@ -83,19 +87,21 @@ struct App {
     receive_label: String,
     tx_search: String,
 
+    logo: Option<egui::TextureHandle>,
     miner: Option<Miner>,
     mine_address: usize,
     mine_threads: usize,
     mine_fast: bool,
-    mine_unsynced: bool,
+    peer_input: String,
 }
 
 impl App {
     fn new(config: NodeConfig, data_dir: PathBuf) -> Self {
         let network = config.network;
         let prefix = Prefix::from(network);
-        let params = node::params_for(network);
+        let params = node::params_for(network, config.testnet_suffix);
         let wallet = Wallet::load_or_create(&data_dir, prefix);
+        let peer_input = config.add_peer.clone().unwrap_or_default();
         let node = Node::start(config);
         if let Ok(w) = &wallet {
             node.set_watch(w.addresses().into_iter().map(|(_, a)| a).collect());
@@ -124,11 +130,12 @@ impl App {
             recently_spent: Vec::new(),
             receive_label: String::new(),
             tx_search: String::new(),
+            logo: None,
             miner: None,
             mine_address: 0,
             mine_threads: default_mine_threads(),
             mine_fast: true,
-            mine_unsynced: false,
+            peer_input,
         }
     }
 
@@ -276,7 +283,7 @@ impl App {
                     if ui.button("Command-line options").clicked() {
                         self.notice = Some((
                             "Command-line options".into(),
-                            "--testnet | --devnet | --simnet   choose the network (default: mainnet)\n--no-spawn   attach to a node that is already running instead of starting one\n--aerod <path>   path to the aerod executable\n--rpc <host:port>   gRPC address of the node".into(),
+                            "--testnet | --devnet | --simnet   choose the network (default: mainnet)\n--netsuffix <n>   testnet number (default: 13)\n--no-spawn   attach to a node that is already running instead of starting one\n--aerod <path>   path to the aerod executable\n--rpc <host:port>   gRPC address of the node".into(),
                         ));
                         ui.close_menu();
                     }
@@ -343,6 +350,8 @@ impl App {
     // ---------------------------------------------------------------- pages
 
     fn page_overview(&mut self, ui: &mut egui::Ui, s: &NodeState) {
+        self.node_controls(ui, s);
+        ui.add_space(8.0);
         if !s.synced {
             egui::Frame::none().fill(Color32::from_rgb(255, 248, 200)).stroke(egui::Stroke::new(1.0, Color32::from_rgb(200, 190, 120))).inner_margin(8.0).show(ui, |ui| {
                 ui.label(RichText::new("Recent transactions may not yet be visible, and therefore your wallet's balance might be incorrect. This information will be correct once your wallet has finished synchronizing with the Aero network, as detailed below.").color(Color32::from_rgb(90, 70, 0)));
@@ -476,6 +485,52 @@ impl App {
         Ok(PendingSend { to, amount, fee: built.fee, tx: built.tx, spent })
     }
 
+    /// Start / stop the node, the peer to connect to, and how many peers are connected.
+    fn node_controls(&mut self, ui: &mut egui::Ui, s: &NodeState) {
+        let running = self.node.poll_process();
+        let (inbound, outbound) = (s.peers.iter().filter(|p| !p.outbound).count(), s.peers.iter().filter(|p| p.outbound).count());
+        group_box(ui, "Node", |ui| {
+            if !self.node.config.spawn {
+                ui.label(format!("Attached to a node that is already running at {}.", self.node.config.rpc_address));
+            } else {
+                ui.horizontal(|ui| {
+                    if running {
+                        if ui.button("Stop node").clicked() {
+                            if let Some(miner) = &self.miner {
+                                miner.stop();
+                            }
+                            self.node.stop_process();
+                        }
+                    } else if ui.button("Start node").clicked() {
+                        self.node.start_process(Some(self.peer_input.trim().to_string()));
+                    }
+                    ui.add_enabled_ui(!running, |ui| {
+                        ui.label("Connect to peer:");
+                        ui.add(egui::TextEdit::singleline(&mut self.peer_input).hint_text("ip:port (optional)").desired_width(200.0));
+                    });
+                });
+            }
+            ui.add_space(4.0);
+            egui::Grid::new("node_status").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
+                ui.label("Status:");
+                ui.label(if s.connected { "Connected".to_string() } else { s.status.clone() });
+                ui.end_row();
+                ui.label("Active peers:");
+                ui.label(RichText::new(format!("{}  ({outbound} outbound, {inbound} inbound)", s.peers.len())).monospace());
+                ui.end_row();
+                ui.label("Sync:");
+                ui.label(if !s.connected {
+                    "-".to_string()
+                } else if s.synced {
+                    "Synced".to_string()
+                } else {
+                    format!("Syncing ({} of {} blocks)", s.block_count, s.header_count)
+                });
+                ui.end_row();
+            });
+        });
+    }
+
     fn page_mine(&mut self, ui: &mut egui::Ui, s: &NodeState) {
         let addresses = self.wallet.as_ref().map(|w| w.addresses()).unwrap_or_default();
         let stats = self.miner.as_ref().map(Miner::stats).unwrap_or_default();
@@ -484,6 +539,11 @@ impl App {
         self.mine_address = self.mine_address.min(addresses.len().saturating_sub(1));
         self.mine_threads = self.mine_threads.clamp(1, max_threads);
 
+        self.node_controls(ui, s);
+        ui.add_space(10.0);
+
+        let private_net = matches!(self.network, NetworkType::Devnet | NetworkType::Simnet);
+        let can_mine = s.connected && (s.synced || private_net);
         let (mut start, mut stop) = (false, false);
         group_box(ui, "Mining", |ui| {
             ui.label("Mine new blocks with this computer's CPU (RandomX). Block rewards are paid to the address below.");
@@ -507,9 +567,6 @@ impl App {
                     ui.checkbox(&mut self.mine_fast, "Fast mode (about 9x faster, needs ~2.5 GiB of free RAM)");
                     ui.end_row();
 
-                    ui.label("Network:");
-                    ui.checkbox(&mut self.mine_unsynced, "Mine even if the node is not synced (only to start a brand-new network)");
-                    ui.end_row();
                 });
             });
             ui.add_space(8.0);
@@ -518,11 +575,11 @@ impl App {
                     if ui.add_enabled(stats.phase != MinerPhase::Stopping, egui::Button::new("Stop mining")).clicked() {
                         stop = true;
                     }
-                } else if ui.add_enabled(!addresses.is_empty(), egui::Button::new("Start mining")).clicked() {
+                } else if ui.add_enabled(can_mine && !addresses.is_empty(), egui::Button::new("Start mining")).clicked() {
                     start = true;
                 }
-                if !s.connected && !active {
-                    ui.label(RichText::new("The node is not connected yet.").weak());
+                if !active && !can_mine {
+                    ui.label(RichText::new(if s.connected { "Mining starts once the node has synced." } else { "Start the node first." }).weak());
                 }
             });
         });
@@ -534,7 +591,8 @@ impl App {
                 let mut config = MinerConfig::new(self.node.config.rpc_address.clone(), address.clone());
                 config.threads = self.mine_threads;
                 config.light = !self.mine_fast;
-                config.mine_unsynced = self.mine_unsynced;
+                // Private test networks have no other miners, so their node is never "synced"; everywhere else wait for sync.
+                config.mine_unsynced = matches!(self.network, NetworkType::Devnet | NetworkType::Simnet);
                 self.miner = Some(Miner::start(config));
             }
         }
@@ -747,6 +805,15 @@ impl App {
                 ctx,
                 |ui| {
                     ui.set_max_width(480.0);
+                    if title.starts_with("About") {
+                        if self.logo.is_none() {
+                            self.logo = load_logo(ctx);
+                        }
+                        if let Some(logo) = &self.logo {
+                            ui.vertical_centered(|ui| ui.add(egui::Image::new(logo).fit_to_exact_size(egui::vec2(96.0, 96.0))));
+                            ui.add_space(6.0);
+                        }
+                    }
                     ui.label(body);
                     ui.add_space(8.0);
                     if ui.button("OK").clicked() {
@@ -843,6 +910,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.node.poll_process();
         let state = self.node.snapshot();
         self.recently_spent.retain(|(_, at)| at.elapsed() < SPENT_HOLD);
 
@@ -896,7 +964,7 @@ fn attach_parent_console() {}
 /// and optionally makes one payment. Returns the process exit code.
 fn selftest(config: NodeConfig, send: Option<(String, String)>) -> i32 {
     let prefix = Prefix::from(config.network);
-    let params = node::params_for(config.network);
+    let params = node::params_for(config.network, config.testnet_suffix);
     let mut wallet = match Wallet::load_or_create(&config.data_dir, prefix) {
         Ok(w) => w,
         Err(e) => {
@@ -1100,6 +1168,13 @@ fn fmt_datetime(unix_secs: u64) -> String {
 }
 
 /// A look close to Qt's default "Fusion" light style, which is what Bitcoin Core uses on most platforms.
+/// Decodes the embedded logo into a texture. `None` if it cannot be decoded, in which case the dialog just has no logo.
+fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let icon = eframe::icon_data::from_png_bytes(ICON_PNG).ok()?;
+    let image = egui::ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba);
+    Some(ctx.load_texture("aero-logo", image, egui::TextureOptions::LINEAR))
+}
+
 fn apply_theme(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::light();
@@ -1109,17 +1184,17 @@ fn apply_theme(ctx: &egui::Context) {
     v.window_fill = window;
     v.extreme_bg_color = Color32::WHITE;
     v.faint_bg_color = Color32::from_rgb(246, 246, 246);
-    v.selection.bg_fill = Color32::from_rgb(48, 140, 198);
+    v.selection.bg_fill = ACCENT;
     v.selection.stroke = egui::Stroke::new(1.0, Color32::WHITE);
     let border = egui::Stroke::new(1.0, Color32::from_rgb(168, 168, 168));
     v.widgets.inactive.weak_bg_fill = Color32::from_rgb(228, 228, 228);
     v.widgets.inactive.bg_fill = Color32::from_rgb(228, 228, 228);
     v.widgets.inactive.bg_stroke = border;
-    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(214, 226, 238);
-    v.widgets.hovered.bg_fill = Color32::from_rgb(214, 226, 238);
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(48, 140, 198));
-    v.widgets.active.weak_bg_fill = Color32::from_rgb(190, 212, 232);
-    v.widgets.active.bg_fill = Color32::from_rgb(190, 212, 232);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(208, 236, 233);
+    v.widgets.hovered.bg_fill = Color32::from_rgb(208, 236, 233);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+    v.widgets.active.weak_bg_fill = Color32::from_rgb(170, 220, 215);
+    v.widgets.active.bg_fill = Color32::from_rgb(170, 220, 215);
     for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
         w.rounding = egui::Rounding::same(2.0);
     }
@@ -1133,6 +1208,7 @@ fn apply_theme(ctx: &egui::Context) {
 
 fn main() -> eframe::Result<()> {
     let mut network = NetworkType::Mainnet;
+    let mut testnet_suffix = 13;
     let mut spawn = true;
     let mut aerod_path: Option<PathBuf> = None;
     let mut rpc_address: Option<String> = None;
@@ -1147,6 +1223,7 @@ fn main() -> eframe::Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--testnet" => network = NetworkType::Testnet,
+            "--netsuffix" => testnet_suffix = args.next().and_then(|v| v.parse().ok()).unwrap_or(testnet_suffix),
             "--devnet" => network = NetworkType::Devnet,
             "--simnet" => network = NetworkType::Simnet,
             "--no-spawn" => spawn = false,
@@ -1183,7 +1260,7 @@ fn main() -> eframe::Result<()> {
     });
     let rpc_address = rpc_address.unwrap_or_else(|| format!("127.0.0.1:{}", network.default_rpc_port()));
     let data_dir = datadir.unwrap_or_else(wallet::data_dir);
-    let config = NodeConfig { network, spawn, aerod_path, rpc_address, data_dir: data_dir.clone(), p2p_port, add_peer };
+    let config = NodeConfig { network, testnet_suffix, spawn, aerod_path, rpc_address, data_dir: data_dir.clone(), p2p_port, add_peer };
 
     if print_address {
         attach_parent_console();
@@ -1204,6 +1281,7 @@ fn main() -> eframe::Result<()> {
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(eframe::icon_data::from_png_bytes(ICON_PNG).expect("the embedded icon is a valid PNG"))
             .with_inner_size([1000.0, 640.0])
             .with_min_inner_size([760.0, 480.0])
             .with_title(title)

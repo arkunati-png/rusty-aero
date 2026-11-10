@@ -4,14 +4,17 @@
 use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use aero_addresses::Address;
 use aero_consensus_core::{
     config::params::Params,
-    network::NetworkType,
+    network::{NetworkId, NetworkType},
     tx::{Transaction, TransactionOutpoint, UtxoEntry},
 };
 use aero_grpc_client::GrpcClient;
@@ -25,6 +28,8 @@ pub const CONFIRMATIONS: u64 = 10;
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
     pub network: NetworkType,
+    /// Testnet number (13 is the public Aero testnet); ignored on other networks.
+    pub testnet_suffix: u32,
     /// Start `aerod` ourselves. Set to false to attach to a node that is already running.
     pub spawn: bool,
     pub aerod_path: PathBuf,
@@ -98,6 +103,8 @@ pub struct Node {
     watch: Arc<Mutex<Vec<Address>>>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     child: Option<Child>,
+    /// Set while the user has stopped the node on purpose, so the status line says so instead of reporting a lost connection.
+    user_stopped: Arc<AtomicBool>,
 }
 
 impl Node {
@@ -106,10 +113,11 @@ impl Node {
         let watch: Arc<Mutex<Vec<Address>>> = Arc::default();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
+        let user_stopped = Arc::new(AtomicBool::new(false));
         let child = if config.spawn { spawn_aerod(&config, &state) } else { None };
 
         {
-            let (config, state, watch) = (config.clone(), Arc::clone(&state), Arc::clone(&watch));
+            let (config, state, watch, user_stopped) = (config.clone(), Arc::clone(&state), Arc::clone(&watch), Arc::clone(&user_stopped));
             std::thread::Builder::new()
                 .name("node-rpc".into())
                 .spawn(move || {
@@ -118,12 +126,49 @@ impl Node {
                         .enable_all()
                         .build()
                         .expect("failed to start the async runtime");
-                    runtime.block_on(run(config, state, watch, cmd_rx));
+                    runtime.block_on(run(config, state, watch, user_stopped, cmd_rx));
                 })
                 .expect("failed to start the RPC thread");
         }
 
-        Self { config, state, watch, cmd_tx, child }
+        Self { config, state, watch, cmd_tx, child, user_stopped }
+    }
+
+    /// Starts the `aerod` process, optionally connecting to `add_peer` (`ip:port`) first. Does nothing if it is already
+    /// running, or if this app is attached to a node it did not start.
+    pub fn start_process(&mut self, add_peer: Option<String>) {
+        self.poll_process();
+        if self.child.is_some() || !self.config.spawn {
+            return;
+        }
+        self.user_stopped.store(false, Ordering::Relaxed);
+        self.config.add_peer = add_peer.filter(|p| !p.trim().is_empty());
+        self.state.lock().unwrap().status = "Starting node...".into();
+        self.child = spawn_aerod(&self.config, &self.state);
+    }
+
+    /// Stops the `aerod` process that this app started.
+    pub fn stop_process(&mut self) {
+        let Some(mut child) = self.child.take() else { return };
+        self.user_stopped.store(true, Ordering::Relaxed);
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut s = self.state.lock().unwrap();
+        *s = NodeState { status: "The node is stopped. Click \"Start node\" to start it.".into(), ..Default::default() };
+    }
+
+    /// True while the `aerod` process started by this app is alive. Notices a process that exited by itself.
+    pub fn poll_process(&mut self) -> bool {
+        if let Some(child) = &mut self.child
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            self.child = None;
+            self.user_stopped.store(true, Ordering::Relaxed);
+            let mut s = self.state.lock().unwrap();
+            s.connected = false;
+            s.status = format!("The node stopped unexpectedly ({status}). Click \"Start node\" to start it again.");
+        }
+        self.child.is_some()
     }
 
     pub fn snapshot(&self) -> NodeState {
@@ -171,7 +216,7 @@ fn spawn_aerod(config: &NodeConfig, state: &Arc<Mutex<NodeState>>) -> Option<Chi
     match config.network {
         NetworkType::Mainnet => {}
         NetworkType::Testnet => {
-            command.arg("--testnet");
+            command.arg("--testnet").arg(format!("--netsuffix={}", config.testnet_suffix));
         }
         // Private test networks have no other miners, so let the node accept locally mined blocks while "unsynced".
         NetworkType::Devnet => {
@@ -203,6 +248,7 @@ async fn run(
     config: NodeConfig,
     state: Arc<Mutex<NodeState>>,
     watch: Arc<Mutex<Vec<Address>>>,
+    user_stopped: Arc<AtomicBool>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
 ) {
     let subscription_context = SubscriptionContext::new();
@@ -219,7 +265,7 @@ async fn run(
                         None => {
                             let mut s = state.lock().unwrap();
                             s.connected = false;
-                            if s.status.is_empty() || !s.status.starts_with("Could not start") {
+                            if !user_stopped.load(Ordering::Relaxed) && (s.status.is_empty() || !s.status.starts_with("Could not start")) {
                                 s.status = "Waiting for the node to start...".into();
                             }
                             continue;
@@ -231,7 +277,9 @@ async fn run(
                 {
                     let mut s = state.lock().unwrap();
                     s.connected = false;
-                    s.status = format!("Lost connection to the node: {e}");
+                    if !user_stopped.load(Ordering::Relaxed) {
+                        s.status = format!("Lost connection to the node: {e}");
+                    }
                     client = None;
                 }
             }
@@ -385,6 +433,9 @@ async fn run_console_command(client: &GrpcClient, line: &str) -> String {
 }
 
 /// Default network parameters, for confirmation depth and block rate.
-pub fn params_for(network: NetworkType) -> Params {
-    Params::from(network)
+pub fn params_for(network: NetworkType, testnet_suffix: u32) -> Params {
+    match network {
+        NetworkType::Testnet => Params::from(NetworkId::with_suffix(NetworkType::Testnet, testnet_suffix)),
+        other => Params::from(other),
+    }
 }
