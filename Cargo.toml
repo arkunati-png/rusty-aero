@@ -116,6 +116,7 @@ aero-randomx = { version = "2.0.1", path = "crypto/randomx" }
 aero-index-core = { version = "2.0.1", path = "indexes/core" }
 aero-index-processor = { version = "2.0.1", path = "indexes/processor" }
 aero-math = { version = "2.0.1", path = "math" }
+aero-miner = { version = "2.0.1", path = "miner" }
 aero-merkle = { version = "2.0.1", path = "crypto/merkle" }
 aero-smt = { version = "2.0.1", path = "crypto/smt", default-features = false }
 aero-smt-store = { version = "2.0.1", path = "consensus/smt-store" }

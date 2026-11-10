@@ -9,6 +9,10 @@ include.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "aero_miner"
+path = "src/lib.rs"
+
 [[bin]]
 name = "aero-miner"
 path = "src/main.rs"

@@ -412,6 +412,7 @@ dependencies = [
  "aero-consensus-core",
  "aero-core",
  "aero-grpc-client",
+ "aero-miner",
  "aero-notify",
  "aero-rpc-core",
  "aero-txscript",

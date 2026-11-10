@@ -18,6 +18,7 @@ aero-addresses.workspace = true
 aero-consensus-core.workspace = true
 aero-core.workspace = true
 aero-grpc-client.workspace = true
+aero-miner.workspace = true
 aero-notify.workspace = true
 aero-rpc-core.workspace = true
 aero-txscript.workspace = true

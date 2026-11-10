@@ -1,7 +1,7 @@
 //! Aero Core: the desktop node and wallet application.
 //!
 //! The window layout follows Bitcoin Core's Qt GUI: a menu bar (File / Settings / Window / Help), a tab toolbar
-//! (Overview / Send / Receive / Transactions), a status bar with sync progress and the connection count, and the
+//! (Overview / Send / Receive / Transactions / Mine), a status bar with sync progress and the connection count, and the
 //! Console, Peers and Information windows. The app starts `aerod` as a child process (or attaches to a running one)
 //! and talks to it over gRPC; see `node.rs` and `wallet.rs`.
 
@@ -18,6 +18,7 @@ use std::{
 
 use aero_addresses::{Address, Prefix};
 use aero_consensus_core::{network::NetworkType, tx::TransactionOutpoint};
+use aero_miner::{Miner, MinerConfig, MinerPhase, MinerStats};
 use eframe::egui::{self, Color32, RichText};
 use node::{CONFIRMATIONS, Cmd, Node, NodeConfig, NodeState, WalletUtxo};
 use wallet::{SentTx, Wallet, data_dir, format_aero, parse_aero, required_fee, unix_now};
@@ -33,6 +34,7 @@ enum Tab {
     Send,
     Receive,
     Transactions,
+    Mine,
 }
 
 struct PendingSend {
@@ -80,6 +82,12 @@ struct App {
 
     receive_label: String,
     tx_search: String,
+
+    miner: Option<Miner>,
+    mine_address: usize,
+    mine_threads: usize,
+    mine_fast: bool,
+    mine_unsynced: bool,
 }
 
 impl App {
@@ -116,6 +124,11 @@ impl App {
             recently_spent: Vec::new(),
             receive_label: String::new(),
             tx_search: String::new(),
+            miner: None,
+            mine_address: 0,
+            mine_threads: default_mine_threads(),
+            mine_fast: true,
+            mine_unsynced: false,
         }
     }
 
@@ -284,7 +297,13 @@ impl App {
             ui.horizontal(|ui| {
                 ui.add_space(4.0);
                 for (tab, text) in
-                    [(Tab::Overview, "Overview"), (Tab::Send, "Send"), (Tab::Receive, "Receive"), (Tab::Transactions, "Transactions")]
+                    [
+                    (Tab::Overview, "Overview"),
+                    (Tab::Send, "Send"),
+                    (Tab::Receive, "Receive"),
+                    (Tab::Transactions, "Transactions"),
+                    (Tab::Mine, "Mine"),
+                ]
                 {
                     let selected = self.tab == tab;
                     let label = RichText::new(text).size(15.0);
@@ -455,6 +474,75 @@ impl App {
         let built = wallet.build_payment(spendable, &to, amount)?;
         let spent = built.tx.inputs.iter().map(|i| i.previous_outpoint).collect();
         Ok(PendingSend { to, amount, fee: built.fee, tx: built.tx, spent })
+    }
+
+    fn page_mine(&mut self, ui: &mut egui::Ui, s: &NodeState) {
+        let addresses = self.wallet.as_ref().map(|w| w.addresses()).unwrap_or_default();
+        let stats = self.miner.as_ref().map(Miner::stats).unwrap_or_default();
+        let active = stats.phase != MinerPhase::Idle;
+        let max_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        self.mine_address = self.mine_address.min(addresses.len().saturating_sub(1));
+        self.mine_threads = self.mine_threads.clamp(1, max_threads);
+
+        let (mut start, mut stop) = (false, false);
+        group_box(ui, "Mining", |ui| {
+            ui.label("Mine new blocks with this computer's CPU (RandomX). Block rewards are paid to the address below.");
+            ui.add_space(6.0);
+            ui.add_enabled_ui(!active, |ui| {
+                egui::Grid::new("mine_form").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+                    ui.label("Reward address:");
+                    let selected = addresses.get(self.mine_address).map_or_else(String::new, |(label, a)| format!("{label}   {a}"));
+                    egui::ComboBox::from_id_salt("mine_address").width(520.0).selected_text(selected).show_ui(ui, |ui| {
+                        for (i, (label, address)) in addresses.iter().enumerate() {
+                            ui.selectable_value(&mut self.mine_address, i, format!("{label}   {address}"));
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("Threads:");
+                    ui.add(egui::Slider::new(&mut self.mine_threads, 1..=max_threads));
+                    ui.end_row();
+
+                    ui.label("Memory:");
+                    ui.checkbox(&mut self.mine_fast, "Fast mode (about 9x faster, needs ~2.5 GiB of free RAM)");
+                    ui.end_row();
+
+                    ui.label("Network:");
+                    ui.checkbox(&mut self.mine_unsynced, "Mine even if the node is not synced (only to start a brand-new network)");
+                    ui.end_row();
+                });
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if active {
+                    if ui.add_enabled(stats.phase != MinerPhase::Stopping, egui::Button::new("Stop mining")).clicked() {
+                        stop = true;
+                    }
+                } else if ui.add_enabled(!addresses.is_empty(), egui::Button::new("Start mining")).clicked() {
+                    start = true;
+                }
+                if !s.connected && !active {
+                    ui.label(RichText::new("The node is not connected yet.").weak());
+                }
+            });
+        });
+        ui.add_space(10.0);
+        group_box(ui, "Status", |ui| mine_status(ui, &stats));
+
+        if start {
+            if let Some((_, address)) = addresses.get(self.mine_address) {
+                let mut config = MinerConfig::new(self.node.config.rpc_address.clone(), address.clone());
+                config.threads = self.mine_threads;
+                config.light = !self.mine_fast;
+                config.mine_unsynced = self.mine_unsynced;
+                self.miner = Some(Miner::start(config));
+            }
+        }
+        if stop {
+            if let Some(miner) = &self.miner {
+                miner.stop();
+            }
+        }
     }
 
     fn page_receive(&mut self, ui: &mut egui::Ui) {
@@ -771,6 +859,7 @@ impl eframe::App for App {
                 Tab::Send => self.page_send(ui, &state),
                 Tab::Receive => self.page_receive(ui),
                 Tab::Transactions => self.page_transactions(ui, &state),
+                Tab::Mine => self.page_mine(ui, &state),
             });
         });
         self.windows(ctx, &state);
@@ -900,6 +989,46 @@ fn selftest(config: NodeConfig, send: Option<(String, String)>) -> i32 {
             None => std::thread::sleep(Duration::from_millis(250)),
         }
     }
+}
+
+/// Half the CPUs (at least one), so the computer stays usable while mining.
+fn default_mine_threads() -> usize {
+    (std::thread::available_parallelism().map_or(2, |n| n.get()) / 2).max(1)
+}
+
+fn mine_status(ui: &mut egui::Ui, stats: &MinerStats) {
+    let phase = match stats.phase {
+        MinerPhase::Idle => "Not mining",
+        MinerPhase::Initializing => "Preparing RandomX (building the dataset takes a while in fast mode)...",
+        MinerPhase::Connecting => "Connecting to the node...",
+        MinerPhase::WaitingForSync => "Waiting for the node to sync...",
+        MinerPhase::Mining => "Mining",
+        MinerPhase::Stopping => "Stopping...",
+    };
+    egui::Grid::new("mine_status").num_columns(2).spacing([24.0, 8.0]).show(ui, |ui| {
+        ui.label("Status:");
+        ui.label(RichText::new(phase).strong());
+        ui.end_row();
+        ui.label("Hash rate:");
+        ui.label(RichText::new(format!("{:.1} H/s", stats.hashrate)).monospace());
+        ui.end_row();
+        ui.label("Hashes:");
+        ui.label(RichText::new(stats.total_hashes.to_string()).monospace());
+        ui.end_row();
+        ui.label("Blocks found:");
+        ui.label(RichText::new(format!("{} ({} accepted, {} rejected)", stats.blocks_found, stats.blocks_accepted, stats.blocks_rejected)).monospace());
+        ui.end_row();
+        ui.label("Running for:");
+        let secs = stats.started_at.filter(|_| stats.phase != MinerPhase::Idle).map_or(0, |t| t.elapsed().as_secs());
+        ui.label(RichText::new(format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)).monospace());
+        ui.end_row();
+    });
+    if !stats.message.is_empty() {
+        ui.add_space(6.0);
+        ui.colored_label(Color32::from_rgb(180, 90, 0), &stats.message);
+    }
+    ui.add_space(6.0);
+    ui.label(RichText::new("Mined rewards show as Immature on the Overview tab until they have matured.").weak());
 }
 
 fn group_box(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
@@ -1092,6 +1221,7 @@ fn main() -> eframe::Result<()> {
                 Some("send") => app.tab = Tab::Send,
                 Some("receive") => app.tab = Tab::Receive,
                 Some("transactions") => app.tab = Tab::Transactions,
+                Some("mine") => app.tab = Tab::Mine,
                 _ => {}
             }
             match initial_window.as_deref() {
