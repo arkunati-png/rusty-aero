@@ -93,6 +93,9 @@ struct App {
     mine_threads: usize,
     mine_fast: bool,
     peer_input: String,
+    /// Ask the router to open the P2P port automatically (UPnP) the next time the node starts.
+    upnp: bool,
+    port_forwarding: (Instant, node::PortForwarding),
 
     /// First run: the recovery phrase must be shown and confirmed before the wallet is used.
     backup_prompt: bool,
@@ -146,6 +149,8 @@ impl App {
             mine_threads: default_mine_threads(),
             mine_fast: true,
             peer_input,
+            upnp: true,
+            port_forwarding: (Instant::now(), node::PortForwarding::Trying),
             backup_prompt,
             backup_confirmed: false,
             show_recovery_phrase: false,
@@ -514,6 +519,10 @@ impl App {
     /// Start / stop the node, the peer to connect to, and how many peers are connected.
     fn node_controls(&mut self, ui: &mut egui::Ui, s: &NodeState) {
         let running = self.node.poll_process();
+        // Reading the log is cheap, but there is no need to do it every frame.
+        if self.port_forwarding.0.elapsed() > Duration::from_secs(3) {
+            self.port_forwarding = (Instant::now(), node::port_forwarding_status(&self.node.config));
+        }
         let (inbound, outbound) = (s.peers.iter().filter(|p| !p.outbound).count(), s.peers.iter().filter(|p| p.outbound).count());
         group_box(ui, "Node", |ui| {
             if !self.node.config.spawn {
@@ -528,13 +537,17 @@ impl App {
                             self.node.stop_process();
                         }
                     } else if ui.button("Start node").clicked() {
-                        self.node.start_process(Some(self.peer_input.trim().to_string()));
+                        self.node.start_process(Some(self.peer_input.trim().to_string()), self.upnp);
                     }
                     ui.add_enabled_ui(!running, |ui| {
                         ui.label("Connect to peer:");
                         ui.add(egui::TextEdit::singleline(&mut self.peer_input).hint_text("ip:port (optional)").desired_width(200.0));
                     });
                 });
+                ui.add_enabled(
+                    !running,
+                    egui::Checkbox::new(&mut self.upnp, "Let other people connect to me (open the port on my router automatically)"),
+                );
             }
             ui.add_space(4.0);
             egui::Grid::new("node_status").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
@@ -543,6 +556,16 @@ impl App {
                 ui.end_row();
                 ui.label("Active peers:");
                 ui.label(RichText::new(format!("{}  ({outbound} outbound, {inbound} inbound)", s.peers.len())).monospace());
+                ui.end_row();
+                ui.label("Port forwarding:");
+                ui.add(egui::Label::new(port_forwarding_text(&self.port_forwarding.1, self.node.config.spawn)).wrap());
+                ui.end_row();
+                ui.label("Incoming:");
+                ui.label(if inbound > 0 {
+                    format!("{inbound} connection{} from other nodes: you are a public node", if inbound == 1 { "" } else { "s" })
+                } else {
+                    "none yet (only outgoing connections)".to_string()
+                });
                 ui.end_row();
                 ui.label("Sync:");
                 ui.label(if !s.connected {
@@ -1207,6 +1230,23 @@ fn selftest(config: NodeConfig, send: Option<(String, String)>) -> i32 {
 }
 
 /// Half the CPUs (at least one), so the computer stays usable while mining.
+fn port_forwarding_text(status: &node::PortForwarding, spawned: bool) -> String {
+    use node::PortForwarding::*;
+    if !spawned {
+        return "managed by the node you attached to".into();
+    }
+    match status {
+        Disabled => "off (you can still connect out, but others cannot connect to you)".into(),
+        Trying => "trying...".into(),
+        Working(address) => format!("on: others can connect to you at {address}"),
+        PublicAddress(address) if address.contains(':') => format!(
+            "your computer has a public IPv6 address ({address}). Only IPv6 peers can reach you; forward the port on your router so IPv4 peers can too"
+        ),
+        PublicAddress(address) => format!("your computer has a public address ({address})"),
+        Unavailable(reason) => format!("not available: {reason}. Forward the port on your router by hand to become a public node"),
+    }
+}
+
 fn default_mine_threads() -> usize {
     (std::thread::available_parallelism().map_or(2, |n| n.get()) / 2).max(1)
 }
@@ -1421,7 +1461,7 @@ fn main() -> eframe::Result<()> {
     });
     let rpc_address = rpc_address.unwrap_or_else(|| format!("127.0.0.1:{}", network.default_rpc_port()));
     let data_dir = datadir.unwrap_or_else(wallet::data_dir);
-    let config = NodeConfig { network, testnet_suffix, spawn, aerod_path, rpc_address, data_dir: data_dir.clone(), p2p_port, add_peer };
+    let config = NodeConfig { network, testnet_suffix, spawn, aerod_path, rpc_address, data_dir: data_dir.clone(), p2p_port, add_peer, upnp: true };
 
     if print_address {
         attach_parent_console();

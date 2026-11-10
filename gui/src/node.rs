@@ -40,6 +40,90 @@ pub struct NodeConfig {
     pub p2p_port: Option<u16>,
     /// `--addpeer`: a peer to connect to at startup.
     pub add_peer: Option<String>,
+    /// Ask the router to forward the P2P port automatically (UPnP), so other people can connect to this node.
+    pub upnp: bool,
+}
+
+/// Where `aerod` writes its log, so the app can read the port forwarding result from it.
+fn node_log_dir(config: &NodeConfig) -> PathBuf {
+    config.data_dir.join("node").join("logs")
+}
+
+/// What the node's automatic port forwarding (UPnP) managed to do, as far as its log says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PortForwarding {
+    /// Turned off in the app.
+    Disabled,
+    /// Nothing in the log yet, or the node is still trying.
+    Trying,
+    /// The router opened the port; other people can reach this node at this public `ip:port`.
+    Working(String),
+    /// The computer itself has a public address, so no router mapping was needed. Whether others can connect then
+    /// depends on the router's firewall letting the port through.
+    PublicAddress(String),
+    /// The router did not open the port (no UPnP, or the ISP shares one public address between customers).
+    Unavailable(String),
+}
+
+/// Reads the end of the node's log for the latest port forwarding result.
+pub fn port_forwarding_status(config: &NodeConfig) -> PortForwarding {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if !config.upnp {
+        return PortForwarding::Disabled;
+    }
+    let Ok(mut file) = std::fs::File::open(node_log_dir(config).join("rusty-aero.log")) else {
+        return PortForwarding::Trying;
+    };
+    let len = file.metadata().map_or(0, |m| m.len());
+    let _ = file.seek(SeekFrom::Start(len.saturating_sub(256 * 1024)));
+    let mut text = String::new();
+    // Lossy: the window may start in the middle of a multi-byte character.
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_ok() {
+        text = String::from_utf8_lossy(&bytes).into_owned();
+    }
+    parse_port_forwarding(&text)
+}
+
+fn parse_port_forwarding(log: &str) -> PortForwarding {
+    // The log keeps earlier runs, so only look at the current one: it starts at the last "Application directory" line.
+    let log = log.rfind("Application directory:").map_or(log, |start| &log[start..]);
+
+    // A mapping made through the router is what makes an IPv4 node reachable, so it takes priority.
+    for line in log.lines().rev().filter(|l| l.contains("[UPnP] Added port mapping to ")) {
+        let rest = line.split("[UPnP] Added port mapping to ").nth(1).unwrap_or("");
+        return PortForwarding::Working(rest.rsplit(": ").next().unwrap_or(rest).trim().to_string());
+    }
+
+    // No router mapping: the computer may still have a public address of its own (typically IPv6).
+    if let Some(line) = log.lines().find(|l| l.contains("Publicly routable local address found: ")) {
+        let address = line.split("Publicly routable local address found: ").nth(1).unwrap_or("").trim();
+        return PortForwarding::PublicAddress(address.to_string());
+    }
+
+    for line in log.lines().rev().filter(|l| l.contains("[UPnP]")) {
+        if line.contains("Non-publicly routable") {
+            return PortForwarding::Unavailable("your internet provider shares one public address between customers".into());
+        }
+        if let Some(rest) = line.split("[UPnP] Error adding port mapping: ").nth(1) {
+            return PortForwarding::Unavailable(short_reason(rest));
+        }
+        if line.contains("Attempting to register upnp") {
+            return PortForwarding::Trying;
+        }
+    }
+    PortForwarding::Trying
+}
+
+/// A short, readable reason for a UPnP failure (the raw error text is long and technical).
+fn short_reason(error: &str) -> String {
+    let lower = error.to_lowercase();
+    if lower.contains("did not properly respond") || lower.contains("timed out") || lower.contains("no gateway") {
+        "your router did not answer; automatic setup may be switched off on it".into()
+    } else {
+        error.trim().chars().take(70).collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -136,13 +220,14 @@ impl Node {
 
     /// Starts the `aerod` process, optionally connecting to `add_peer` (`ip:port`) first. Does nothing if it is already
     /// running, or if this app is attached to a node it did not start.
-    pub fn start_process(&mut self, add_peer: Option<String>) {
+    pub fn start_process(&mut self, add_peer: Option<String>, upnp: bool) {
         self.poll_process();
         if self.child.is_some() || !self.config.spawn {
             return;
         }
         self.user_stopped.store(false, Ordering::Relaxed);
         self.config.add_peer = add_peer.filter(|p| !p.trim().is_empty());
+        self.config.upnp = upnp;
         self.state.lock().unwrap().status = "Starting node...".into();
         self.child = spawn_aerod(&self.config, &self.state);
     }
@@ -207,6 +292,10 @@ fn spawn_aerod(config: &NodeConfig, state: &Arc<Mutex<NodeState>>) -> Option<Chi
     let mut command = Command::new(&config.aerod_path);
     command.arg("--utxoindex").arg(format!("--rpclisten={}", config.rpc_address));
     command.arg("--appdir").arg(config.data_dir.join("node"));
+    command.arg("--logdir").arg(node_log_dir(config));
+    if !config.upnp {
+        command.arg("--disable-upnp");
+    }
     if let Some(port) = config.p2p_port {
         command.arg(format!("--listen=0.0.0.0:{port}"));
     }
@@ -437,5 +526,62 @@ pub fn params_for(network: NetworkType, testnet_suffix: u32) -> Params {
     match network {
         NetworkType::Testnet => Params::from(NetworkId::with_suffix(NetworkType::Testnet, testnet_suffix)),
         other => Params::from(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_port_forwarding_is_read_from_the_node_log() {
+        let attempting = "2026-11-10 18:00:00.000+00:00 [INFO ] [UPnP] Attempting to register upnp... (to disable run the node with --disable-upnp)";
+        assert_eq!(parse_port_forwarding(""), PortForwarding::Trying);
+        assert_eq!(parse_port_forwarding(attempting), PortForwarding::Trying);
+
+        let working = format!("{attempting}\n2026-11-10 18:00:01.000+00:00 [INFO ] [UPnP] Added port mapping to default external port: 203.0.113.7:16711\n");
+        assert_eq!(parse_port_forwarding(&working), PortForwarding::Working("203.0.113.7:16711".into()));
+
+        let random = format!("{attempting}\n2026-11-10 18:00:01.000+00:00 [INFO ] [UPnP] Added port mapping to random external port: 203.0.113.7:50123\n");
+        assert_eq!(parse_port_forwarding(&random), PortForwarding::Working("203.0.113.7:50123".into()));
+
+        let failed = format!("{attempting}\n2026-11-10 18:00:01.000+00:00 [WARN ] [UPnP] Error adding port mapping: no gateway found\n");
+        assert!(matches!(parse_port_forwarding(&failed), PortForwarding::Unavailable(_)));
+        assert_eq!(short_reason("IO error: A connection attempt failed because the connected party did not properly respond"), "your router did not answer; automatic setup may be switched off on it");
+        assert!(short_reason(&"x".repeat(500)).len() <= 70);
+
+        let cgnat = format!("{attempting}\n2026-11-10 18:00:01.000+00:00 [INFO ] [UPnP] Non-publicly routable external ip from gateway using upnp 100.64.1.2 not added to store\n");
+        assert!(matches!(parse_port_forwarding(&cgnat), PortForwarding::Unavailable(_)));
+
+        // A node with its own public (IPv6) address skips the router and says so.
+        let ipv6 = "2026-11-10 18:00:00.000+00:00 [INFO ] Application directory: x\n2026-11-10 18:00:00.500+00:00 [INFO ] Publicly routable local address found: 2a0a::1\n";
+        assert_eq!(parse_port_forwarding(ipv6), PortForwarding::PublicAddress("2a0a::1".into()));
+        // ...even if the router mapping then failed, because the node still advertises that address.
+        let ipv6_failed = format!("{ipv6}2026-11-10 18:00:01.000+00:00 [WARN ] [UPnP] Error adding port mapping: no gateway found\n");
+        assert_eq!(parse_port_forwarding(&ipv6_failed), PortForwarding::PublicAddress("2a0a::1".into()));
+        // Only the current run counts: an old failure before the last start is ignored.
+        let two_runs = format!("{failed}\n2026-11-10 19:00:00.000+00:00 [INFO ] Application directory: x\n");
+        assert_eq!(parse_port_forwarding(&two_runs), PortForwarding::Trying);
+
+        // The newest result wins, e.g. after a restart on a different router.
+        let restarted = format!("{failed}\n{attempting}\n");
+        assert_eq!(parse_port_forwarding(&restarted), PortForwarding::Trying);
+    }
+
+    #[test]
+    fn test_port_forwarding_off_is_reported_without_reading_any_log() {
+        let config = NodeConfig {
+            network: NetworkType::Simnet,
+            testnet_suffix: 13,
+            spawn: true,
+            aerod_path: PathBuf::new(),
+            rpc_address: String::new(),
+            data_dir: PathBuf::from("does-not-exist"),
+            p2p_port: None,
+            add_peer: None,
+            upnp: false,
+        };
+        assert_eq!(port_forwarding_status(&config), PortForwarding::Disabled);
+        assert_eq!(port_forwarding_status(&NodeConfig { upnp: true, ..config }), PortForwarding::Trying);
     }
 }

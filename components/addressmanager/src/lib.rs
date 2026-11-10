@@ -75,7 +75,9 @@ impl AddressManager {
     fn init_local_addresses(&mut self, tick_service: Arc<TickService>) -> Option<Extender> {
         self.local_net_addresses = self.local_addresses().collect();
 
-        let extender = if self.local_net_addresses.is_empty() && !self.config.disable_upnp {
+        // Try UPnP unless the node already has a public IPv4 address. A public IPv6 address alone is not enough: IPv4-only
+        // peers (most of the network) cannot dial it, so the node would look unreachable to them.
+        let extender = if !self.local_net_addresses.iter().any(|a| a.ip.is_ipv4()) && !self.config.disable_upnp {
             let (net_address, ExtendHelper { gateway, local_addr, external_port }) = match self.upnp() {
                 Err(err) => {
                     warn!("[UPnP] Error adding port mapping: {err}");
