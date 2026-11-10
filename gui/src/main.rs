@@ -314,7 +314,7 @@ impl App {
                     if ui.button("Command-line options").clicked() {
                         self.notice = Some((
                             "Command-line options".into(),
-                            "--testnet | --devnet | --simnet   choose the network (default: mainnet)\n--netsuffix <n>   testnet number (default: 13)\n--no-spawn   attach to a node that is already running instead of starting one\n--aerod <path>   path to the aerod executable\n--rpc <host:port>   gRPC address of the node".into(),
+                            "--testnet | --devnet | --simnet   choose the network (default: testnet 13; mainnet is not enabled yet)\n--netsuffix <n>   testnet number (default: 13)\n--no-spawn   attach to a node that is already running instead of starting one\n--aerod <path>   path to the aerod executable\n--rpc <host:port>   gRPC address of the node".into(),
                         ));
                         ui.close_menu();
                     }
@@ -1408,7 +1408,8 @@ fn apply_theme(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
-    let mut network = NetworkType::Mainnet;
+    // Mainnet is not enabled in this version, so the default is the public testnet (13).
+    let mut network = NetworkType::Testnet;
     let mut testnet_suffix = 13;
     let mut spawn = true;
     let mut aerod_path: Option<PathBuf> = None;
@@ -1424,6 +1425,7 @@ fn main() -> eframe::Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--testnet" => network = NetworkType::Testnet,
+            "--mainnet" => network = NetworkType::Mainnet,
             "--netsuffix" => testnet_suffix = args.next().and_then(|v| v.parse().ok()).unwrap_or(testnet_suffix),
             "--devnet" => network = NetworkType::Devnet,
             "--simnet" => network = NetworkType::Simnet,

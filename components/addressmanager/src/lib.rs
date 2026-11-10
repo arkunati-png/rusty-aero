@@ -143,8 +143,11 @@ impl AddressManager {
                 warn!("Error getting network interfaces: {:?}", network_interfaces);
                 return Left(Right(iter::empty()));
             };
-            // TODO: Add Check IPv4 or IPv6 match from Go code
-            Right(network_interfaces.into_iter().map(|(_, ip)| IpAddress::from(ip)).filter(|&ip| ip.is_publicly_routable()).map(
+            // Only advertise addresses of the family the node actually listens on. The default listen address is
+            // 0.0.0.0 (IPv4 only), so announcing this machine's IPv6 addresses would tell peers to dial a port that
+            // nothing is listening on.
+            let listens_on_ipv4 = listen_address.ip.is_ipv4();
+            Right(network_interfaces.into_iter().map(|(_, ip)| IpAddress::from(ip)).filter(move |&ip| ip.is_publicly_routable() && ip.is_ipv4() == listens_on_ipv4).map(
                 |ip| {
                     info!("Publicly routable local address found: {}", ip);
                     NetAddress::new(ip, self.config.default_p2p_port())
@@ -157,7 +160,10 @@ impl AddressManager {
 
     fn upnp(&self) -> Result<Option<(NetAddress, ExtendHelper)>, UpnpError> {
         info!("[UPnP] Attempting to register upnp... (to disable run the node with --disable-upnp)");
-        let gateway = igd::search_gateway(Default::default())?;
+        // A router that supports UPnP answers within a second or two. Do not make every start wait the 10s default
+        // on routers that do not.
+        let search = igd::SearchOptions { timeout: Some(Duration::from_secs(4)), ..Default::default() };
+        let gateway = igd::search_gateway(search)?;
         let ip = IpAddress::new(gateway.get_external_ip()?);
         if !ip.is_publicly_routable() {
             info!("[UPnP] Non-publicly routable external ip from gateway using upnp {} not added to store", ip);

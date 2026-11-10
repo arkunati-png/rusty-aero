@@ -25,6 +25,9 @@ use tokio::sync::mpsc;
 /// How many confirmations (in DAA score) an ordinary output needs before it counts as available.
 pub const CONFIRMATIONS: u64 = 10;
 
+/// How long to wait for the node before treating it as gone and reconnecting.
+const RPC_TIMEOUT: Duration = Duration::from_secs(8);
+
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
     pub network: NetworkType,
@@ -42,6 +45,34 @@ pub struct NodeConfig {
     pub add_peer: Option<String>,
     /// Ask the router to forward the P2P port automatically (UPnP), so other people can connect to this node.
     pub upnp: bool,
+}
+
+/// Everything `aerod` prints, overwritten at each start.
+fn node_output_path(config: &NodeConfig) -> PathBuf {
+    config.data_dir.join("node").join("aerod-output.log")
+}
+
+fn read_node_output(config: &NodeConfig) -> String {
+    std::fs::read_to_string(node_output_path(config)).unwrap_or_default()
+}
+
+/// A plain-language reason why `aerod` stopped, from what it printed on the way out.
+fn explain_exit(output: &str) -> Option<String> {
+    if output.contains("Don't run on mainnet") {
+        return Some("mainnet is not enabled in this version yet. Use the testnet.".into());
+    }
+    if output.contains("Address already in use") || output.contains("os error 10048") {
+        return Some("another program, or another copy of the node, is already using its network port.".into());
+    }
+    if output.contains("LOCK") && output.contains("lock") && output.contains("IO error") {
+        return Some("the node's database is in use by another copy of the node. Close it and try again.".into());
+    }
+    let last = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("note:") && !l.starts_with("Exiting"))
+        .next_back()?;
+    Some(last.chars().take(140).collect())
 }
 
 /// Where `aerod` writes its log, so the app can read the port forwarding result from it.
@@ -251,7 +282,10 @@ impl Node {
             self.user_stopped.store(true, Ordering::Relaxed);
             let mut s = self.state.lock().unwrap();
             s.connected = false;
-            s.status = format!("The node stopped unexpectedly ({status}). Click \"Start node\" to start it again.");
+            s.status = match explain_exit(&read_node_output(&self.config)) {
+                Some(reason) => format!("The node could not run: {reason}"),
+                None => format!("The node stopped unexpectedly ({status}). Click \"Start node\" to start it again."),
+            };
         }
         self.child.is_some()
     }
@@ -315,7 +349,18 @@ fn spawn_aerod(config: &NodeConfig, state: &Arc<Mutex<NodeState>>) -> Option<Chi
             command.arg("--simnet").arg("--enable-unsynced-mining");
         }
     }
-    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // Keep the node's output, so that if it dies right away the app can say why.
+    command.stdin(Stdio::null());
+    let output = node_output_path(config);
+    let _ = std::fs::create_dir_all(output.parent().unwrap_or(&config.data_dir));
+    match std::fs::File::create(&output).and_then(|f| f.try_clone().map(|g| (f, g))) {
+        Ok((out, err)) => {
+            command.stdout(out).stderr(err);
+        }
+        Err(_) => {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
 
     #[cfg(windows)]
     {
@@ -348,8 +393,17 @@ async fn run(
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                // The node was stopped on purpose: let go of the old connection. It is set to reconnect by itself, and
+                // calls on it would otherwise block until the node comes back, which stops a fresh connection being made.
+                if user_stopped.load(Ordering::Relaxed) {
+                    if let Some(old) = client.take() {
+                        let _ = tokio::time::timeout(Duration::from_secs(2), old.disconnect()).await;
+                    }
+                    state.lock().unwrap().connected = false;
+                    continue;
+                }
                 if client.is_none() {
-                    match connect(&config.rpc_address, &subscription_context).await {
+                    match tokio::time::timeout(RPC_TIMEOUT, connect(&config.rpc_address, &subscription_context)).await.unwrap_or(None) {
                         Some(c) => client = Some(c),
                         None => {
                             let mut s = state.lock().unwrap();
@@ -362,14 +416,20 @@ async fn run(
                     }
                 }
                 if let Some(c) = client.as_ref()
-                    && let Err(e) = refresh(c, &config, &state, &watch).await
+                    && let Err(e) = tokio::time::timeout(RPC_TIMEOUT, refresh(c, &config, &state, &watch))
+                        .await
+                        .unwrap_or_else(|_| Err("the node did not answer in time".to_string()))
                 {
                     let mut s = state.lock().unwrap();
                     s.connected = false;
                     if !user_stopped.load(Ordering::Relaxed) {
                         s.status = format!("Lost connection to the node: {e}");
                     }
-                    client = None;
+                    drop(s);
+                    // Close it properly, so the old connection does not keep trying to reconnect in the background.
+                    if let Some(old) = client.take() {
+                        let _ = tokio::time::timeout(Duration::from_secs(2), old.disconnect()).await;
+                    }
                 }
             }
             Some(cmd) = cmd_rx.recv() => {
@@ -583,5 +643,62 @@ mod tests {
         };
         assert_eq!(port_forwarding_status(&config), PortForwarding::Disabled);
         assert_eq!(port_forwarding_status(&NodeConfig { upnp: true, ..config }), PortForwarding::Trying);
+    }
+
+    #[test]
+    fn test_a_node_that_exits_right_away_is_explained() {
+        let mainnet = "2026-11-10 18:49:07.893+00:00 [ERROR] thread 'main' panicked at aerod\\src\\daemon.rs:287:9: Experimental. Don't run on mainnet\nExiting...\n";
+        assert!(explain_exit(mainnet).unwrap().contains("mainnet is not enabled"));
+        assert!(explain_exit("[ERROR] bind failed: Address already in use (os error 98)").unwrap().contains("network port"));
+        // Anything else: show the last line it printed.
+        assert_eq!(explain_exit("starting\nsomething broke\nnote: run with RUST_BACKTRACE\n").unwrap(), "something broke");
+        assert_eq!(explain_exit(""), None);
+    }
+
+    /// Starts a real `aerod`, stops it, and starts it again, as the Start node / Stop node buttons do.
+    /// Run with `AEROD_PATH=<path to aerod> cargo test -p aero-core-gui -- --ignored node_can_be_stopped_and_started_again`.
+    #[test]
+    #[ignore = "starts a real aerod (set AEROD_PATH)"]
+    fn node_can_be_stopped_and_started_again() {
+        let Some(aerod_path) = std::env::var_os("AEROD_PATH").map(PathBuf::from) else {
+            panic!("set AEROD_PATH to the aerod executable");
+        };
+        let data_dir = std::env::temp_dir().join(format!("aero-node-restart-{}", std::process::id()));
+        let config = NodeConfig {
+            network: NetworkType::Simnet,
+            testnet_suffix: 13,
+            spawn: true,
+            aerod_path,
+            rpc_address: "127.0.0.1:16510".into(),
+            data_dir: data_dir.clone(),
+            p2p_port: None,
+            add_peer: None,
+            // Skip the router search, which is slow and irrelevant here.
+            upnp: false,
+        };
+        let wait_connected = |node: &mut Node, want: bool| {
+            for _ in 0..120 {
+                node.poll_process();
+                if node.snapshot().connected == want {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            false
+        };
+
+        let mut node = Node::start(config);
+        assert!(wait_connected(&mut node, true), "first start: {}", node.snapshot().status);
+        node.stop_process();
+        assert!(!node.poll_process());
+        assert!(wait_connected(&mut node, false));
+        assert!(node.snapshot().status.contains("stopped"), "status after Stop: {}", node.snapshot().status);
+
+        node.start_process(None, false);
+        assert!(node.poll_process(), "the process should be running after Start node");
+        assert!(wait_connected(&mut node, true), "second start: {}", node.snapshot().status);
+
+        node.stop_process();
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
