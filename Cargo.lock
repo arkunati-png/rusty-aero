@@ -409,6 +409,7 @@ name = "aero-core-gui"
 version = "2.0.1"
 dependencies = [
  "aero-addresses",
+ "aero-bip32",
  "aero-consensus-core",
  "aero-core",
  "aero-grpc-client",
