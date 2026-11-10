@@ -182,8 +182,9 @@ async fn testnet13_dagknight_4bps_sanity_test() {
     assert_eq!(params.ghostdag_k(), 55);
     assert!(params.dagknight_activation.is_active(0));
     assert!(params.crescendo_activation.is_active(0));
-    // Emission is expressed in the network's own BPS: 4x the blocks must mean 1/4 of the per-block subsidy
-    assert_eq!(params.pre_deflationary_phase_base_subsidy, 50_000_000_000 / 4);
+    // Emission matches mainnet: 0.1 ARO per block, halving every 500M blocks (about 240 ARO per 10 minutes at 4 BPS)
+    assert_eq!(params.pre_deflationary_phase_base_subsidy, 10_000_000);
+    assert_eq!(params.halving_interval, Some(500_000_000));
     assert_eq!(params.bps_history().before(), 4);
 
     let config = ConfigBuilder::new(params).skip_proof_of_work().build();
