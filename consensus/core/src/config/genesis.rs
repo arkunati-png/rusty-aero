@@ -185,14 +185,14 @@ pub const DEVNET_GENESIS: GenesisBlock = GenesisBlock {
 
 pub const TESTNET13_GENESIS: GenesisBlock = GenesisBlock {
     hash: Hash::from_bytes([
-        0xcb, 0xc6, 0x63, 0xfa, 0x43, 0x80, 0xa1, 0x89, 0xb1, 0x6c, 0xcb, 0xfc, 0xeb, 0x94, 0xac, 0xce, 0x90, 0x25, 0xb9, 0xd6, 0x41,
-        0xdb, 0x96, 0x85, 0x82, 0xe8, 0x57, 0xb2, 0xf4, 0xc9, 0x5a, 0x69,
+        0xf8, 0xe0, 0xe9, 0x78, 0x40, 0x8a, 0x0b, 0x37, 0x60, 0xf6, 0x48, 0xad, 0x56, 0x98, 0xd3, 0x1a, 0x22, 0xeb, 0x23, 0xa5, 0x2d,
+        0xca, 0xdd, 0xe4, 0x68, 0x6b, 0x59, 0x75, 0x52, 0x28, 0xbd, 0x2c,
     ]),
     hash_merkle_root: Hash::from_bytes([
         0x46, 0x7f, 0x8a, 0xc5, 0x3f, 0xf9, 0x8f, 0xe9, 0x3c, 0x96, 0x2d, 0x25, 0xbe, 0x7a, 0x1f, 0xb1, 0x99, 0xa1, 0x10, 0xc8, 0x30,
         0x39, 0xcf, 0x1b, 0x53, 0xeb, 0x38, 0x3c, 0xb3, 0xbf, 0x05, 0xa3,
     ]),
-    bits: 504155340, // see `gen_testnet13_genesis`
+    bits: 537542000, // 0x200a3d70: ~25 hashes per block (100 H/s at 250ms), see `gen_testnet13_genesis`
     #[rustfmt::skip]
     coinbase_payload: &[
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Blue score
@@ -239,14 +239,20 @@ mod tests {
 
     #[test]
     fn gen_testnet13_genesis() {
-        let bps = TenBps::bps();
-        let mut genesis = TESTNET_GENESIS;
-        let target = aero_math::Uint256::from_compact_target_bits(genesis.bits);
-        let scaled_target = target * bps / 100;
-        let scaled_bits = scaled_target.compact_target_bits();
-        genesis.bits = scaled_bits;
-        if genesis.bits != TESTNET13_GENESIS.bits {
-            panic!("Testnet 13: new bits: {}\nnew hash: {:#04x?}", scaled_bits, Block::from(&genesis).hash().as_bytes());
+        // Same starting difficulty as mainnet: a single low-end CPU (100 H/s) finds a block in about 250ms. RandomX
+        // is CPU-mined, so the 1.3M hashes per block that the old Kaspa-derived value implied would stall a new testnet.
+        const TESTNET13_INITIAL_HASHRATE: u64 = 100; // H/s
+        let hashes_per_block = TESTNET13_INITIAL_HASHRATE * crate::config::bps::Bps::<4>::target_time_per_block() / 1000;
+        let target = aero_math::Uint256::MAX / hashes_per_block;
+        let mut genesis = TESTNET13_GENESIS;
+        genesis.bits = target.compact_target_bits();
+        if genesis.bits != TESTNET13_GENESIS.bits || Block::from(&genesis).hash() != TESTNET13_GENESIS.hash {
+            panic!(
+                "Testnet 13: new bits: {}
+new hash: {:#04x?}",
+                genesis.bits,
+                Block::from(&genesis).hash().as_bytes()
+            );
         }
     }
 

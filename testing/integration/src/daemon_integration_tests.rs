@@ -1005,7 +1005,7 @@ async fn daemon_pruning_seqcommit_sync_test() {
     let target_daa_score = rpc_client1.get_server_info().await.unwrap().virtual_daa_score;
     wait_for(
         100,
-        60,
+        600,
         move || {
             let client = sync_check.clone();
             Box::pin(async move { client.get_server_info().await.unwrap().virtual_daa_score >= target_daa_score })

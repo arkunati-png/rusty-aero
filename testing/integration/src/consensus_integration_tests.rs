@@ -714,30 +714,35 @@ async fn mergeset_size_limit_test() {
 }
 
 #[tokio::test]
+#[ignore = "replays a DAG recorded on Kaspa mainnet; block levels come from its old PoW hash, so it cannot pass on a RandomX chain"]
 async fn goref_custom_pruning_depth_test() {
     init_allocator_with_default_settings();
     json_test("testdata/dags_for_json_tests/goref_custom_pruning_depth", false).await
 }
 
 #[tokio::test]
+#[ignore = "replays a DAG recorded on Kaspa mainnet; block levels come from its old PoW hash, so it cannot pass on a RandomX chain"]
 async fn goref_notx_test() {
     init_allocator_with_default_settings();
     json_test("testdata/dags_for_json_tests/goref-notx-5000-blocks", false).await
 }
 
 #[tokio::test]
+#[ignore = "replays a DAG recorded on Kaspa mainnet; block levels come from its old PoW hash, so it cannot pass on a RandomX chain"]
 async fn goref_notx_concurrent_test() {
     init_allocator_with_default_settings();
     json_test("testdata/dags_for_json_tests/goref-notx-5000-blocks", true).await
 }
 
 #[tokio::test]
+#[ignore = "replays a DAG recorded on Kaspa mainnet; block levels come from its old PoW hash, so it cannot pass on a RandomX chain"]
 async fn goref_tx_small_test() {
     init_allocator_with_default_settings();
     json_test("testdata/dags_for_json_tests/goref-1060-tx-265-blocks", false).await
 }
 
 #[tokio::test]
+#[ignore = "replays a DAG recorded on Kaspa mainnet; block levels come from its old PoW hash, so it cannot pass on a RandomX chain"]
 async fn goref_tx_small_concurrent_test() {
     init_allocator_with_default_settings();
     json_test("testdata/dags_for_json_tests/goref-1060-tx-265-blocks", true).await
