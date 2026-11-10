@@ -93,6 +93,15 @@ struct App {
     mine_threads: usize,
     mine_fast: bool,
     peer_input: String,
+
+    /// First run: the recovery phrase must be shown and confirmed before the wallet is used.
+    backup_prompt: bool,
+    backup_confirmed: bool,
+    show_recovery_phrase: bool,
+    show_restore: bool,
+    restore_input: String,
+    restore_error: Option<String>,
+    restore_confirmed: bool,
 }
 
 impl App {
@@ -106,6 +115,7 @@ impl App {
         if let Ok(w) = &wallet {
             node.set_watch(w.addresses().into_iter().map(|(_, a)| a).collect());
         }
+        let backup_prompt = wallet.as_ref().is_ok_and(|w| w.recovery_phrase().is_some() && !w.seed_backed_up());
         Self {
             node,
             wallet,
@@ -136,6 +146,13 @@ impl App {
             mine_threads: default_mine_threads(),
             mine_fast: true,
             peer_input,
+            backup_prompt,
+            backup_confirmed: false,
+            show_recovery_phrase: false,
+            show_restore: false,
+            restore_input: String::new(),
+            restore_error: None,
+            restore_confirmed: false,
         }
     }
 
@@ -210,6 +227,15 @@ impl App {
                     ui.add_enabled(false, egui::Button::new("Open Wallet"));
                     ui.add_enabled(false, egui::Button::new("Close Wallet..."));
                     ui.separator();
+                    if ui.button("Show Recovery Phrase...").clicked() {
+                        self.show_recovery_phrase = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Restore from Recovery Phrase...").clicked() {
+                        self.show_restore = true;
+                        self.restore_error = None;
+                        ui.close_menu();
+                    }
                     if ui.button("Backup Wallet...").clicked() {
                         let path = self.wallet.as_ref().map(|w| w.path().display().to_string()).unwrap_or_default();
                         self.notice = Some((
@@ -799,6 +825,8 @@ impl App {
         egui::Window::new("Receiving addresses").open(&mut open).default_size([640.0, 320.0]).show(ctx, |ui| self.address_table(ui));
         self.show_receiving_addresses = open;
 
+        self.recovery_dialogs(ctx);
+
         // Generic notice
         if let Some((title, body)) = self.notice.clone() {
             egui::Window::new(&title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(
@@ -824,6 +852,125 @@ impl App {
         }
 
         self.send_dialogs(ctx, s);
+    }
+
+    /// The first-run backup prompt, the "show recovery phrase" window, and the restore window.
+    fn recovery_dialogs(&mut self, ctx: &egui::Context) {
+        let phrase = self.wallet.as_ref().ok().and_then(|w| w.recovery_phrase().map(str::to_string));
+
+        // First run: the phrase cannot be skipped. Without it, losing this computer means losing the coins.
+        if self.backup_prompt {
+            if let Some(phrase) = &phrase {
+                let mut done = false;
+                egui::Window::new("Write down your recovery phrase")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.set_max_width(560.0);
+                        ui.label(
+                            "These words are the only way to recover your wallet if this computer is lost or broken. \
+                             Write them down, in order, on paper and keep them somewhere safe and private.",
+                        );
+                        ui.add_space(8.0);
+                        phrase_grid(ui, phrase);
+                        ui.add_space(8.0);
+                        ui.colored_label(
+                            Color32::from_rgb(180, 30, 30),
+                            "Anyone who has these words can take all of your coins. Never share them or type them into a website.",
+                        );
+                        ui.add_space(8.0);
+                        ui.checkbox(&mut self.backup_confirmed, "I have written down my recovery phrase");
+                        ui.add_space(4.0);
+                        if ui.add_enabled(self.backup_confirmed, egui::Button::new("Continue")).clicked() {
+                            done = true;
+                        }
+                    });
+                if done {
+                    if let Ok(w) = &mut self.wallet {
+                        w.mark_seed_backed_up();
+                    }
+                    self.backup_prompt = false;
+                    self.backup_confirmed = false;
+                }
+            } else {
+                self.backup_prompt = false;
+            }
+        }
+
+        if self.show_recovery_phrase {
+            let mut open = true;
+            egui::Window::new("Recovery phrase").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                match &phrase {
+                    Some(phrase) => {
+                        ui.colored_label(
+                            Color32::from_rgb(180, 30, 30),
+                            "Anyone who sees these words can take all of your coins. Make sure nobody is watching your screen.",
+                        );
+                        ui.add_space(8.0);
+                        phrase_grid(ui, phrase);
+                    }
+                    None => {
+                        ui.label(
+                            "This wallet was created before recovery phrases existed, so it has none and cannot be recovered from words. \
+                             To get one, restore or create a new wallet and send your coins to it.",
+                        );
+                    }
+                }
+            });
+            self.show_recovery_phrase = open;
+        }
+
+        if self.show_restore {
+            let mut open = true;
+            let mut restore = false;
+            egui::Window::new("Restore from recovery phrase").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                ui.label("Type the 12 or 24 words of your recovery phrase, separated by spaces.");
+                ui.add_space(6.0);
+                ui.add(egui::TextEdit::multiline(&mut self.restore_input).desired_rows(3).desired_width(f32::INFINITY).hint_text("word1 word2 word3 ..."));
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "This replaces the current wallet on this network. Your current wallet file is kept as a backup next to it. \
+                         The first 20 addresses are restored; coins on later addresses will appear once you create addresses up to them.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.restore_confirmed, "I understand this replaces the current wallet");
+                if let Some(e) = &self.restore_error {
+                    ui.add_space(4.0);
+                    ui.colored_label(Color32::from_rgb(180, 30, 30), e);
+                }
+                ui.add_space(6.0);
+                if ui.add_enabled(self.restore_confirmed && !self.restore_input.trim().is_empty(), egui::Button::new("Restore")).clicked() {
+                    restore = true;
+                }
+            });
+            if restore {
+                match Wallet::restore(&self.data_dir, self.prefix, &self.restore_input) {
+                    Ok(wallet) => {
+                        self.wallet = Ok(wallet);
+                        self.rebuild_watch();
+                        self.mine_address = 0;
+                        self.restore_input.clear();
+                        self.restore_error = None;
+                        self.restore_confirmed = false;
+                        open = false;
+                        self.notice = Some(("Wallet restored".into(), "Your wallet was restored from the recovery phrase. It will show your balance once the node has synced.".into()));
+                    }
+                    Err(e) => self.restore_error = Some(e),
+                }
+            }
+            if !open {
+                self.restore_input.clear();
+                self.restore_error = None;
+                self.restore_confirmed = false;
+            }
+            self.show_restore = open;
+        }
     }
 
     fn send_dialogs(&mut self, ctx: &egui::Context, s: &NodeState) {
@@ -1097,6 +1244,20 @@ fn mine_status(ui: &mut egui::Ui, stats: &MinerStats) {
     }
     ui.add_space(6.0);
     ui.label(RichText::new("Mined rewards show as Immature on the Overview tab until they have matured.").weak());
+}
+
+/// The recovery phrase as a numbered grid, four words per row.
+fn phrase_grid(ui: &mut egui::Ui, phrase: &str) {
+    egui::Frame::none().fill(Color32::WHITE).stroke(egui::Stroke::new(1.0, Color32::from_rgb(168, 168, 168))).inner_margin(10.0).show(ui, |ui| {
+        egui::Grid::new("recovery_phrase_grid").num_columns(4).spacing([28.0, 8.0]).show(ui, |ui| {
+            for (i, word) in phrase.split_whitespace().enumerate() {
+                ui.label(RichText::new(format!("{:>2}. {word}", i + 1)).monospace().size(15.0));
+                if (i + 1) % 4 == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+    });
 }
 
 fn group_box(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {

@@ -1,8 +1,12 @@
 //! A simple file-backed wallet: a list of Schnorr keys, receiving addresses derived from them, and transaction
 //! building/signing over the outputs the node reports for those addresses.
 //!
-//! PRE-RELEASE: keys are stored in `wallet.json` UNENCRYPTED. Do not keep real funds in this wallet until encryption
-//! is implemented (see the "Encrypt Wallet" menu entry).
+//! New wallets are created from a 12-word BIP39 recovery phrase: every key is derived from it with BIP32 at
+//! `m/44'/777777'/0'/0/<index>`, so the phrase alone restores the wallet. Older wallets (random keys with no phrase)
+//! still load, but cannot be recovered from words.
+//!
+//! PRE-RELEASE: the recovery phrase and keys are stored in `wallet-<network>.json` UNENCRYPTED. Do not keep real funds
+//! in this wallet until encryption is implemented (see the "Encrypt Wallet" menu entry).
 
 use std::{
     fs,
@@ -10,7 +14,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use std::str::FromStr;
+
 use aero_addresses::{Address, Prefix, Version};
+use aero_bip32::{DerivationPath, ExtendedPrivateKey, Language, Mnemonic, SecretKey, WordCount};
 use aero_consensus_core::{
     constants::{SOMPI_PER_AERO, TX_VERSION},
     sign::{Signed, sign_with_multiple_v2},
@@ -30,12 +37,20 @@ const FEE_RATE: u64 = 110;
 const NORMALIZED_TRANSIENT_BYTE_FACTOR: u64 = 2;
 /// Outputs below this are not created: change smaller than this is added to the fee instead.
 const DUST: u64 = 1_000;
+/// BIP44 coin type for Aero's key derivation. Deliberately not Kaspa's (111111), so a Kaspa recovery phrase and an
+/// Aero wallet never share keys.
+const COIN_TYPE: u32 = 777_777;
+/// How many addresses a restore derives up front (there is no chain scan to find used ones).
+const RESTORE_ADDRESSES: u32 = 20;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct KeyEntry {
     pub secret_hex: String,
     pub label: String,
     pub created: u64,
+    /// Position in the recovery phrase's derivation path; `None` for a random key that the phrase cannot recreate.
+    #[serde(default)]
+    pub index: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -51,6 +66,15 @@ pub struct SentTx {
 struct WalletFile {
     keys: Vec<KeyEntry>,
     sent: Vec<SentTx>,
+    /// The BIP39 recovery phrase, for wallets created with one.
+    #[serde(default)]
+    mnemonic: Option<String>,
+    /// The next derivation index for a new receiving address.
+    #[serde(default)]
+    next_index: u32,
+    /// Whether the user confirmed that they wrote the phrase down.
+    #[serde(default)]
+    seed_backed_up: bool,
 }
 
 pub struct Wallet {
@@ -90,9 +114,52 @@ impl Wallet {
         };
         let mut wallet = Self { path, prefix, file };
         if wallet.file.keys.is_empty() {
+            let mnemonic = Mnemonic::random(WordCount::Words12, Language::English)
+                .map_err(|e| format!("cannot create a recovery phrase: {e}"))?;
+            wallet.file.mnemonic = Some(mnemonic.phrase().to_string());
             wallet.new_key("(no label)")?;
         }
         Ok(wallet)
+    }
+
+    /// Restores a wallet from a recovery phrase, replacing the current wallet file for this network. The old file is
+    /// kept next to it as `*.backup-<time>`, so no key is ever destroyed.
+    pub fn restore(dir: &Path, prefix: Prefix, phrase: &str) -> Result<Self, String> {
+        let phrase = phrase.split_whitespace().map(str::to_lowercase).collect::<Vec<_>>().join(" ");
+        let mnemonic = Mnemonic::new(&phrase, Language::English)
+            .map_err(|_| "That is not a valid recovery phrase. Check the words, their spelling and their order.".to_string())?;
+
+        fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let path = dir.join(format!("wallet-{}.json", prefix));
+        if path.exists() {
+            let backup = dir.join(format!("wallet-{}.json.backup-{}", prefix, unix_now()));
+            fs::rename(&path, &backup).map_err(|e| format!("cannot back up the current wallet to {}: {e}", backup.display()))?;
+        }
+
+        let mut wallet = Self {
+            path,
+            prefix,
+            file: WalletFile { mnemonic: Some(mnemonic.phrase().to_string()), seed_backed_up: true, ..Default::default() },
+        };
+        for _ in 0..RESTORE_ADDRESSES {
+            wallet.new_key("(restored)")?;
+        }
+        Ok(wallet)
+    }
+
+    /// The recovery phrase, if this wallet has one.
+    pub fn recovery_phrase(&self) -> Option<&str> {
+        self.file.mnemonic.as_deref()
+    }
+
+    /// True once the user confirmed writing the phrase down (always true for restored wallets).
+    pub fn seed_backed_up(&self) -> bool {
+        self.file.seed_backed_up
+    }
+
+    pub fn mark_seed_backed_up(&mut self) {
+        self.file.seed_backed_up = true;
+        let _ = self.save();
     }
 
     fn save(&self) -> Result<(), String> {
@@ -106,8 +173,18 @@ impl Wallet {
 
     /// Creates a new key, saves the wallet, and returns its address.
     pub fn new_key(&mut self, label: &str) -> Result<Address, String> {
-        let keypair = Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng());
-        let entry = KeyEntry { secret_hex: hex_encode(&keypair.secret_bytes()), label: label.to_string(), created: unix_now() };
+        let (keypair, index) = match &self.file.mnemonic {
+            Some(phrase) => {
+                let index = self.file.next_index;
+                let keypair = Keypair::from_seckey_slice(secp256k1::SECP256K1, &derive_secret(phrase, index)?)
+                    .map_err(|e| format!("derived an invalid key: {e}"))?;
+                self.file.next_index += 1;
+                (keypair, Some(index))
+            }
+            // An older wallet without a recovery phrase keeps getting random keys.
+            None => (Keypair::new(secp256k1::SECP256K1, &mut rand::thread_rng()), None),
+        };
+        let entry = KeyEntry { secret_hex: hex_encode(&keypair.secret_bytes()), label: label.to_string(), created: unix_now(), index };
         self.file.keys.push(entry);
         self.save()?;
         Ok(self.address_of(&keypair))
@@ -245,6 +322,18 @@ pub fn parse_aero(text: &str) -> Result<u64, String> {
     whole.checked_mul(SOMPI_PER_AERO).and_then(|w| w.checked_add(fraction)).ok_or_else(|| "The amount is too large.".to_string())
 }
 
+/// The private key at `m/44'/COIN_TYPE'/0'/0/index` for a BIP39 phrase.
+fn derive_secret(phrase: &str, index: u32) -> Result<[u8; 32], String> {
+    let mnemonic = Mnemonic::new(phrase, Language::English).map_err(|e| format!("invalid recovery phrase: {e}"))?;
+    let seed = mnemonic.to_seed("");
+    let path =
+        DerivationPath::from_str(&format!("m/44'/{COIN_TYPE}'/0'/0/{index}")).map_err(|e| format!("bad derivation path: {e}"))?;
+    let key = ExtendedPrivateKey::<SecretKey>::new(seed.as_bytes())
+        .and_then(|root| root.derive_path(&path))
+        .map_err(|e| format!("key derivation failed: {e}"))?;
+    Ok(key.to_bytes().into())
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -298,6 +387,101 @@ mod tests {
         // Reloading finds the same keys.
         let reloaded = Wallet::load_or_create(&dir, Prefix::Devnet).unwrap();
         assert_eq!(reloaded.addresses().len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("aero-gui-{name}-{}-{}", std::process::id(), unix_now()))
+    }
+
+    const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn test_new_wallets_have_a_12_word_phrase_that_restores_them() {
+        let dir = temp_dir("seed");
+        let mut wallet = Wallet::load_or_create(&dir, Prefix::Devnet).unwrap();
+        wallet.new_key("second").unwrap();
+        let phrase = wallet.recovery_phrase().expect("new wallets have a phrase").to_string();
+        assert_eq!(phrase.split_whitespace().count(), 12);
+        assert!(!wallet.seed_backed_up());
+        let originals = wallet.addresses();
+
+        // The same phrase, in another folder, recreates the same addresses in the same order.
+        let other = temp_dir("seed-restore");
+        let mut restored = Wallet::restore(&other, Prefix::Devnet, &phrase).unwrap();
+        assert!(restored.seed_backed_up());
+        let restored_addresses = restored.addresses();
+        assert_eq!(restored_addresses.len(), RESTORE_ADDRESSES as usize);
+        for (original, again) in originals.iter().zip(&restored_addresses) {
+            assert_eq!(original.1, again.1);
+        }
+        // New addresses carry on after the restored ones, never reusing an index.
+        let next = restored.new_key("next").unwrap();
+        assert!(restored_addresses.iter().all(|(_, a)| *a != next));
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn test_known_phrase_gives_a_stable_address() {
+        // The standard BIP39 test phrase. If the address changes, existing users' funds would move: do not "fix" it.
+        let dir = temp_dir("known");
+        let wallet = Wallet::restore(&dir, Prefix::Mainnet, TEST_PHRASE).unwrap();
+        let first = wallet.addresses()[0].1.to_string();
+        let again = Wallet::restore(&temp_dir("known2"), Prefix::Mainnet, &format!("  {}  ", TEST_PHRASE.to_uppercase())).unwrap();
+        assert_eq!(first, again.addresses()[0].1.to_string(), "extra spaces and capitals must not matter");
+        assert_eq!(first, "aero:qphedg2n2njepsgru2824xrktukxhrsqtpr7j49z7svjj2ns84ngwcaegtpjj");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_invalid_phrases_are_rejected_and_do_not_touch_the_wallet() {
+        let dir = temp_dir("invalid");
+        let wallet = Wallet::load_or_create(&dir, Prefix::Devnet).unwrap();
+        let before = wallet.addresses();
+        // Bad checksum, unknown word, wrong length, empty.
+        for bad in [
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon zzzzzz",
+            "abandon abandon abandon",
+            "",
+        ] {
+            assert!(Wallet::restore(&dir, Prefix::Devnet, bad).is_err(), "accepted: {bad:?}");
+        }
+        let reloaded = Wallet::load_or_create(&dir, Prefix::Devnet).unwrap();
+        assert_eq!(before, reloaded.addresses());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_restore_keeps_a_backup_of_the_old_wallet() {
+        let dir = temp_dir("backup");
+        let old = Wallet::load_or_create(&dir, Prefix::Devnet).unwrap();
+        let old_addresses = old.addresses();
+        let restored = Wallet::restore(&dir, Prefix::Devnet, TEST_PHRASE).unwrap();
+        assert_ne!(old_addresses[0].1, restored.addresses()[0].1);
+        let backups = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().contains(".backup-")).count();
+        assert_eq!(backups, 1, "the replaced wallet file must be kept");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_older_wallet_files_without_a_phrase_still_load() {
+        let dir = temp_dir("legacy");
+        fs::create_dir_all(&dir).unwrap();
+        let secret = "11".repeat(32);
+        fs::write(
+            dir.join(format!("wallet-{}.json", Prefix::Devnet)),
+            format!(r#"{{"keys":[{{"secret_hex":"{secret}","label":"old","created":1}}],"sent":[]}}"#),
+        )
+        .unwrap();
+        let mut wallet = Wallet::load_or_create(&dir, Prefix::Devnet).unwrap();
+        assert!(wallet.recovery_phrase().is_none());
+        assert_eq!(wallet.addresses().len(), 1);
+        wallet.new_key("more").unwrap();
+        assert_eq!(wallet.addresses().len(), 2);
+        assert!(wallet.recovery_phrase().is_none(), "an old wallet must not silently gain a phrase it cannot be recovered from");
         let _ = fs::remove_dir_all(&dir);
     }
 }

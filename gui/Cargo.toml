@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 aero-addresses.workspace = true
+aero-bip32.workspace = true
 aero-consensus-core.workspace = true
 aero-core.workspace = true
 aero-grpc-client.workspace = true
