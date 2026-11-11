@@ -16,8 +16,9 @@
 - [ ] Merge `dagknight-swap` into `main` and push.
 - [ ] CI green (`cargo check --tests --workspace --benches`, tests, clippy, fmt).
 - [ ] Tag a release; `deploy.yaml` builds `aero-core` (desktop app), `aerod`, `aero-wallet`, `aero-miner`,
-  `stratum-bridge`, `rothschild` for Linux, Windows and macOS. The workflow has never run: check the first run, in
-  particular the Linux `aero-core` step (gnu build with GL/X11/Wayland dev packages) and the macOS build.
+  `stratum-bridge`, `rothschild` for **Windows only** (Linux and macOS were removed until tested). The workflow
+  has never run: check the first run. Re-adding Linux means a musl build plus a gnu build of `aero-core` with
+  GL/X11/Wayland dev packages; see this file's git history.
 - [ ] Windows installer / signed binaries (unsigned `.exe` will trigger SmartScreen warnings).
 - [ ] `SECURITY.md` with a vulnerability-reporting contact.
 - [ ] Scan git history for committed secrets (keys, seed phrases, wallet files) before making the repo public.

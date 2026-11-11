@@ -31,8 +31,8 @@ Aero Core bundles a node, a wallet and a miner in one window: Overview, Send, Re
 Start/Stop node button, a peer count, and optional port forwarding (UPnP) so your node can accept inbound
 connections. It defaults to testnet.
 
-1. Download the build for your OS from the [releases page](https://github.com/arkunati-png/rusty-aero/releases),
-   or build it yourself: `cargo build --release -p aero-core-gui` (binary: `aero-core`).
+1. Download the Windows build from the [releases page](https://github.com/arkunati-png/rusty-aero/releases)
+   (Windows only for now; on Linux or macOS, build it yourself): `cargo build --release -p aero-core-gui` (binary: `aero-core`).
 2. Create a wallet and **write down the 12-word recovery phrase**. It is the only way to restore your coins.
 3. Press *Start node* and wait for it to sync. Mining waits for sync automatically.
 4. Use the *Mine* tab to mine to your own address, or see [docs/mining.md](docs/mining.md) for the standalone
