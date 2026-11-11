@@ -14,7 +14,6 @@ console.log(aero.version());
 
 ## Documentation
 
-Documentation is available at [https://kaspa.aspectron.org/docs/](https://kaspa.aspectron.org/docs/)
 
 
 ## Building from source & Examples
@@ -25,5 +24,4 @@ SDK examples as well as information on building the project from source can be f
 
 Official releases as well as releases for Web Browsers are available at [https://github.com/arkunati-png/rusty-aero/releases](https://github.com/arkunati-png/rusty-aero/releases).
 
-Nightly / developer builds are available at: [https://aspectron.org/en/projects/kaspa-wasm.html](https://aspectron.org/en/projects/kaspa-wasm.html)
 

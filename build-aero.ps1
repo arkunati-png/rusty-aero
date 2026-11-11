@@ -104,19 +104,23 @@ Ok "CMAKE_GENERATOR  = Ninja"
 
 if ($NoBuild) { Write-Host "`nPrerequisites OK (-NoBuild given, stopping here)." -ForegroundColor Cyan; exit 0 }
 
-$cargo = @("+$Toolchain")
-$profileArgs = if ($Debug) { @() } else { @("--release") }
+$cargoArgs = @("+$Toolchain")
+# cargo writes warnings to stderr; under "Stop" Windows PowerShell 5.1 would turn them into fatal errors.
+# Success is judged by $LASTEXITCODE below instead.
+$ErrorActionPreference = "Continue"
 
 # --- Tests (optional) ---------------------------------------------------------------------------------------------------
 if ($Test) {
     Write-Host "`n== Running tests ==" -ForegroundColor Cyan
-    & cargo @cargo test --workspace --no-fail-fast
+    & cargo @cargoArgs test --workspace --no-fail-fast
     if ($LASTEXITCODE -ne 0) { Fail "Some tests failed (see above). Fix them or build without -Test." }
 }
 
 # --- Build --------------------------------------------------------------------------------------------------------------
 Write-Host "`n== Building aerod, aero-miner and aero-core ($Profile) ==" -ForegroundColor Cyan
-& cargo @cargo build @profileArgs -p aerod -p aero-miner -p aero-core-gui
+# (--release is passed literally: splatting "--release" from an array makes Windows PowerShell 5.1 hand cargo a stray "-")
+if ($Debug) { & cargo @cargoArgs build -p aerod -p aero-miner -p aero-core-gui }
+else { & cargo @cargoArgs build --release -p aerod -p aero-miner -p aero-core-gui }
 if ($LASTEXITCODE -ne 0) { Fail "Build failed (see the compiler errors above)." }
 
 $bin = Join-Path $TargetDir $Profile

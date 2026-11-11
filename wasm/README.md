@@ -11,9 +11,7 @@ codebase within JavaScript and TypeScript environments such as Node.js and Web B
 
 ## Documentation
 
-- [**integrating with Aero** guide](https://kaspa.aspectron.org/)
 - [**Rust** documentation](https://docs.rs/kaspa-wasm/latest/kaspa_wasm/index.html)
-- [**TypeScript** documentation](https://kaspa.aspectron.org/docs/)
 
 Please note that while WASM directly binds JavaScript and Rust resources, their names on JavaScript side
 are different from their name in Rust as they conform to the 'camelCase' convention in JavaScript and 
@@ -188,7 +186,6 @@ const rpc = new RpcClient({
 })();
 ```
 
-For more details, please follow the [**integrating with Aero**](https://kaspa.aspectron.org/) guide.
 
 ## Creating Documentation
 

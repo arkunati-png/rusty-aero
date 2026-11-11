@@ -13,9 +13,7 @@ codebase within JavaScript environments such as Node.js and Web Browsers.
 
 ## Documentation
 
-- [**Integrating with Aero** guide](https://kaspa.aspectron.org/)
 - [Rust SDK documentation (**Rustdoc**)](https://docs.rs/kaspa-wasm/)
-- [TypeScript documentation (**JSDoc**)](https://kaspa.aspectron.org/docs/)
 
 Please note that while WASM directly binds JavaScript and Rust resources, their names on JavaScript side
 are different from their name in Rust as they conform to the 'camelCase' convention in JavaScript and
@@ -60,10 +58,8 @@ repository at <https://github.com/arkunati-png/rusty-aero/releases>.
 
 ## Development Builds
 
-The latest development builds from <https://kaspa.aspectron.org/nightly/downloads/>.
 Development builds typically contain fixes and improvements that are not yet available in
 stable releases. Additional information can be found at
-<https://aspectron.org/en/projects/kaspa-wasm.html>.
 
 ## Using RPC
 
@@ -138,7 +134,6 @@ const rpc = new RpcClient({
 })();
 ```
 
-For more details, please follow the [**Integrating with Aero**](https://kaspa.aspectron.org/) guide.
 
 */
 

@@ -9,11 +9,18 @@
   bits) forks the chain. Edit it, regenerate with `gen_mainnet_genesis`, and re-run the test *before* publishing.
 
 ## Before publishing
-- [ ] Push the repo to its own GitHub repository (not the upstream `kaspanet` remote) and replace the upstream
-  URLs in `Cargo.toml`, `README.md`, `CONTRIBUTING.md`, `docs/` and `wasm/`.
+- [x] Repo lives at `arkunati-png/rusty-aero`; user-facing upstream links (README, CONTRIBUTING, wasm docs, bridge UI)
+  are replaced. What remains is deliberate: `NOTICE`/`LICENSE` credit, code comments citing upstream KIPs, and the
+  historical Crescendo/Toccata guides in `docs/`.
+- [x] README states the network status (testnet 13 public, mainnet not live) and how to get Aero Core.
+- [ ] Merge `dagknight-swap` into `main` and push.
 - [ ] CI green (`cargo check --tests --workspace --benches`, tests, clippy, fmt).
-- [ ] Tag a release; `deploy.yaml` builds `aerod`, `aero-wallet`, `aero-miner`, `stratum-bridge`, `rothschild`
-  for Linux, Windows and macOS.
+- [ ] Tag a release; `deploy.yaml` builds `aero-core` (desktop app), `aerod`, `aero-wallet`, `aero-miner`,
+  `stratum-bridge`, `rothschild` for Linux, Windows and macOS. The workflow has never run: check the first run, in
+  particular the Linux `aero-core` step (gnu build with GL/X11/Wayland dev packages) and the macOS build.
+- [ ] Windows installer / signed binaries (unsigned `.exe` will trigger SmartScreen warnings).
+- [ ] `SECURITY.md` with a vulnerability-reporting contact.
+- [ ] Scan git history for committed secrets (keys, seed phrases, wallet files) before making the repo public.
 - [ ] Publish a Docker image built from `docker/Dockerfile.aerod`.
 
 ## Network infrastructure (see `running-a-seed-node.md`)

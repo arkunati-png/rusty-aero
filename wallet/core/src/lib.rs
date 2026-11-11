@@ -40,20 +40,8 @@
 //! within native Rust applications as well as within NodeJS, Bun
 //! and browser environments via the WASM32 SDK.
 //!
-//! WASM32 SDK documentation is available at:
-//! <https://kaspa.aspectron.org/docs/>
-//!
-//! For NodeJS JavaScript and TypeScript environments, there are two
-//! available NPM modules:
-//! - <https://www.npmjs.com/package/kaspa>
-//! - <https://www.npmjs.com/package/kaspa-wasm>
-//!
-//! NOTE: for security reasons (to mitigate potential upstream vendor
-//! attacks) it is always recommended to build WASM SDK from source or
-//! download pre-built redistributables.
-//!
-//! Latest development builds of the WASM32 SDK can be found at:
-//! <https://aspectron.org/en/projects/kaspa-wasm.html>
+//! The WASM32 SDK is built from this repository (see `wasm/build-release`).
+//! There are no hosted documentation or nightly builds yet.
 //!
 //! The `aero-wasm` module is a pure WASM32 module that includes
 //! the entire wallet framework, but does not support RPC due to an absence

@@ -1,5 +1,3 @@
-Latest online documentation available at: https://kaspa.aspectron.org/docs/
-
 ### Latest Release
 
 - Replace `MassCalculator` with `calculateTransactionMass` and `calculateTransactionFee` functions.
