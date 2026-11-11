@@ -17,7 +17,7 @@ use std::{
 };
 
 use aero_addresses::{Address, Prefix};
-use aero_consensus_core::{network::NetworkType, tx::TransactionOutpoint};
+use aero_consensus_core::{network::{NetworkId, NetworkType}, tx::TransactionOutpoint};
 use aero_miner::{Miner, MinerConfig, MinerPhase, MinerStats};
 use eframe::egui::{self, Color32, RichText};
 use node::{CONFIRMATIONS, Cmd, Node, NodeConfig, NodeState, WalletUtxo};
@@ -39,6 +39,7 @@ enum Tab {
     Receive,
     Transactions,
     Mine,
+    Public,
 }
 
 struct PendingSend {
@@ -341,6 +342,7 @@ impl App {
                     (Tab::Receive, "Receive"),
                     (Tab::Transactions, "Transactions"),
                     (Tab::Mine, "Mine"),
+                    (Tab::Public, "Go public"),
                 ]
                 {
                     let selected = self.tab == tab;
@@ -546,8 +548,20 @@ impl App {
                 });
                 ui.add_enabled(
                     !running,
-                    egui::Checkbox::new(&mut self.upnp, "Let other people connect to me (open the port on my router automatically)"),
+                    egui::Checkbox::new(&mut self.upnp, "Try to become a public node (let other people connect in)"),
                 );
+                if self.upnp {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                "You only count as a public node once someone outside your network has connected in. To get there, make sure TCP                                  port {} is forwarded to this computer on your router. The app tries to do it automatically (UPnP), but many                                  routers have UPnP turned off. If the status below says it is not open, forward the port by hand (router                                  settings, Port Forwarding) and allow it through the Windows firewall. Leave this off to run a normal private                                  node: it works fully, others just cannot connect in to you.",
+                                p2p_port(&self.node.config)
+                            ))
+                            .weak(),
+                        )
+                        .wrap(),
+                    );
+                }
             }
             ui.add_space(4.0);
             egui::Grid::new("node_status").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
@@ -558,13 +572,18 @@ impl App {
                 ui.label(RichText::new(format!("{}  ({outbound} outbound, {inbound} inbound)", s.peers.len())).monospace());
                 ui.end_row();
                 ui.label("Port forwarding:");
-                ui.add(egui::Label::new(port_forwarding_text(&self.port_forwarding.1, self.node.config.spawn)).wrap());
+                ui.add(egui::Label::new(port_forwarding_text(&self.port_forwarding.1, self.node.config.spawn, p2p_port(&self.node.config))).wrap());
                 ui.end_row();
-                ui.label("Incoming:");
-                ui.label(if inbound > 0 {
-                    format!("{inbound} connection{} from other nodes: you are a public node", if inbound == 1 { "" } else { "s" })
+                ui.label("Node type:");
+                let outside = node::outside_inbound_count(&s.peers);
+                ui.label(if outside > 0 {
+                    format!("PUBLIC NODE (verified): {outside} peer{} outside your network connected in", if outside == 1 { "" } else { "s" })
+                } else if inbound > 0 {
+                    format!("{inbound} incoming connection{}, but only from your own network: not verified as public", if inbound == 1 { "" } else { "s" })
+                } else if self.upnp && running {
+                    "private for now: nobody outside has connected in yet. Check the port forward".to_string()
                 } else {
-                    "none yet (only outgoing connections)".to_string()
+                    "private node: you connect out to others and nobody connects in. That works fine".to_string()
                 });
                 ui.end_row();
                 ui.label("Sync:");
@@ -580,6 +599,98 @@ impl App {
         });
     }
 
+    /// Explains, with the exact values for this computer, how to let other people connect in.
+    fn page_public(&mut self, ui: &mut egui::Ui, s: &NodeState) {
+        let port = p2p_port(&self.node.config);
+        let local_ip = local_ip_address().unwrap_or_else(|| "(could not detect: run ipconfig and use your IPv4 address)".to_string());
+        let outside = node::outside_inbound_count(&s.peers);
+        let firewall = if cfg!(windows) {
+            format!("New-NetFirewallRule -DisplayName \"Aero P2P\" -Direction Inbound -Protocol TCP -LocalPort {port} -Action Allow")
+        } else {
+            format!("sudo ufw allow {port}/tcp")
+        };
+
+        group_box(ui, "Your status", |ui| {
+            if outside > 0 {
+                ui.colored_label(
+                    Color32::from_rgb(20, 130, 40),
+                    format!("PUBLIC NODE (verified): {outside} peer{} outside your network connected in.", if outside == 1 { "" } else { "s" }),
+                );
+            } else {
+                ui.label(
+                    "Private node. It works fully; you connect out to others, but nobody connects in to you.                      Follow the steps below to become a public node. You are public once someone outside your network connects in.",
+                );
+            }
+        });
+        ui.add_space(8.0);
+
+        group_box(ui, "1. Forward this port on your router", |ui| {
+            egui::Grid::new("forward_values").num_columns(3).spacing([16.0, 6.0]).show(ui, |ui| {
+                for (label, value) in [
+                    ("Protocol:", "TCP".to_string()),
+                    ("External port:", port.to_string()),
+                    ("Internal port:", port.to_string()),
+                    ("Internal IP address (this computer):", local_ip.clone()),
+                ] {
+                    ui.label(label);
+                    ui.label(RichText::new(&value).monospace().strong());
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(value);
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    "Open your router's page (often http://192.168.1.1 or http://192.168.0.1; the address is on a sticker on the router) and look                      for Port Forwarding, NAT or Virtual Server. Add a rule with the values above. Also reserve this computer's address in the                      router (DHCP reservation) so it does not change, or the rule will point at the wrong machine later.",
+                )
+                .wrap(),
+            );
+        });
+        ui.add_space(8.0);
+
+        group_box(ui, "2. Allow it through this computer's firewall", |ui| {
+            ui.label(if cfg!(windows) { "Run this in PowerShell as administrator:" } else { "Run this in a terminal:" });
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(RichText::new(&firewall).monospace()).wrap());
+                if ui.small_button("Copy").clicked() {
+                    ui.ctx().copy_text(firewall.clone());
+                }
+            });
+        });
+        ui.add_space(8.0);
+
+        group_box(ui, "3. Make sure your internet provider allows it", |ui| {
+            ui.add(
+                egui::Label::new(
+                    "Some providers share one public address between many customers (CGNAT), and then no port forward can work. To check,                      compare the Internet/WAN IP shown on your router's status page with the address a \"what is my IP\" website shows. If                      they differ, or the router's one starts with 100., you are behind CGNAT: run the node on a cloud server instead.",
+                )
+                .wrap(),
+            );
+        });
+        ui.add_space(8.0);
+
+        group_box(ui, "4. Start the node as public", |ui| {
+            ui.add(
+                egui::Label::new(
+                    "On the Overview tab tick \"Try to become a public node\" and press Start node (restart it if it was already running).                      This tab and the Overview tab turn to PUBLIC NODE (verified) once someone outside your network connects in. That can take                      a few minutes, because other nodes have to learn your address first.",
+                )
+                .wrap(),
+            );
+        });
+        ui.add_space(8.0);
+
+        group_box(ui, "Privacy: who can see your IP address", |ui| {
+            ui.add(
+                egui::Label::new(
+                    "Every node you connect to sees your IP address, public or not. A public node also shares its address with other nodes so                      they can find it, which means anyone running a node can see and record your home IP address. If you do not want that,                      stay a private node, or run the public node on a cloud server instead of at home.",
+                )
+                .wrap(),
+            );
+        });
+    }
+
     fn page_mine(&mut self, ui: &mut egui::Ui, s: &NodeState) {
         let addresses = self.wallet.as_ref().map(|w| w.addresses()).unwrap_or_default();
         let stats = self.miner.as_ref().map(Miner::stats).unwrap_or_default();
@@ -591,8 +702,7 @@ impl App {
         self.node_controls(ui, s);
         ui.add_space(10.0);
 
-        let private_net = matches!(self.network, NetworkType::Devnet | NetworkType::Simnet);
-        let can_mine = s.connected && (s.synced || private_net);
+        let can_mine = s.connected && (s.synced || node::mines_unsynced(self.network));
         let (mut start, mut stop) = (false, false);
         group_box(ui, "Mining", |ui| {
             ui.label("Mine new blocks with this computer's CPU (RandomX). Block rewards are paid to the address below.");
@@ -640,8 +750,8 @@ impl App {
                 let mut config = MinerConfig::new(self.node.config.rpc_address.clone(), address.clone());
                 config.threads = self.mine_threads;
                 config.light = !self.mine_fast;
-                // Private test networks have no other miners, so their node is never "synced"; everywhere else wait for sync.
-                config.mine_unsynced = matches!(self.network, NetworkType::Devnet | NetworkType::Simnet);
+                // Test networks may have no other miners, so their node is never "synced"; mainnet waits for sync.
+                config.mine_unsynced = node::mines_unsynced(self.network);
                 self.miner = Some(Miner::start(config));
             }
         }
@@ -1098,6 +1208,7 @@ impl eframe::App for App {
                 Tab::Receive => self.page_receive(ui),
                 Tab::Transactions => self.page_transactions(ui, &state),
                 Tab::Mine => self.page_mine(ui, &state),
+                Tab::Public => self.page_public(ui, &state),
             });
         });
         self.windows(ctx, &state);
@@ -1109,7 +1220,11 @@ impl eframe::App for App {
 // -------------------------------------------------------------------------------------------------- helpers
 
 /// An output is available once it has enough confirmations (DAA score); coinbase outputs need twice the maturity.
+/// A network with no coinbase maturity (the test network) has no waiting at all.
 fn is_spendable_utxo(u: &WalletUtxo, virtual_daa: u64, coinbase_maturity: u64) -> bool {
+    if coinbase_maturity == 0 {
+        return true;
+    }
     let needed = if u.is_coinbase { coinbase_maturity * 2 } else { CONFIRMATIONS };
     u.daa_score + needed < virtual_daa
 }
@@ -1230,7 +1345,16 @@ fn selftest(config: NodeConfig, send: Option<(String, String)>) -> i32 {
 }
 
 /// Half the CPUs (at least one), so the computer stays usable while mining.
-fn port_forwarding_text(status: &node::PortForwarding, spawned: bool) -> String {
+/// The port the node listens on for other nodes: the one given with `--p2p-port`, else the network's default.
+fn p2p_port(config: &node::NodeConfig) -> u16 {
+    config.p2p_port.unwrap_or_else(|| match config.network {
+        NetworkType::Testnet => NetworkId::with_suffix(NetworkType::Testnet, config.testnet_suffix),
+        other => NetworkId::new(other),
+    }
+    .default_p2p_port())
+}
+
+fn port_forwarding_text(status: &node::PortForwarding, spawned: bool, port: u16) -> String {
     use node::PortForwarding::*;
     if !spawned {
         return "managed by the node you attached to".into();
@@ -1243,7 +1367,9 @@ fn port_forwarding_text(status: &node::PortForwarding, spawned: bool) -> String 
             "your computer has a public IPv6 address ({address}). Only IPv6 peers can reach you; forward the port on your router so IPv4 peers can too"
         ),
         PublicAddress(address) => format!("your computer has a public address ({address})"),
-        Unavailable(reason) => format!("not available: {reason}. Forward the port on your router by hand to become a public node"),
+        Unavailable(reason) => format!(
+            "NOT OPEN: {reason}. Others cannot connect to you yet. Turn on UPnP in your router, or forward TCP port {port} to this computer by hand"
+        ),
     }
 }
 
@@ -1298,6 +1424,15 @@ fn phrase_grid(ui: &mut egui::Ui, phrase: &str) {
             }
         });
     });
+}
+
+/// This computer's address on the local network (what a router port forward must point at). Connecting a UDP socket
+/// only picks a route; no packet is sent.
+fn local_ip_address() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then(|| ip.to_string())
 }
 
 fn group_box(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {

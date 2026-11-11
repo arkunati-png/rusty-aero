@@ -32,7 +32,8 @@ use tokio::time::{Instant, MissedTickBehavior, interval};
 
 mod gas;
 
-const DEFAULT_SEND_AMOUNT: u64 = 10 * SOMPI_PER_AERO;
+// Block rewards are 0.1 ARO, so the amount per transaction must be far smaller than a typical coinbase.
+const DEFAULT_SEND_AMOUNT: u64 = SOMPI_PER_AERO / 100;
 const MILLIS_PER_TICK: u64 = 10;
 const ADDRESS_VERSION: Version = Version::PubKey;
 

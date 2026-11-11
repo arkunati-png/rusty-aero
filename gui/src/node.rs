@@ -25,6 +25,12 @@ use tokio::sync::mpsc;
 /// How many confirmations (in DAA score) an ordinary output needs before it counts as available.
 pub const CONFIRMATIONS: u64 = 10;
 
+/// Whether mining is allowed while the node says it is not synced. True on every test network: a new one has no
+/// recent blocks, so its node never counts as synced until somebody mines the first blocks. Only mainnet waits for sync.
+pub fn mines_unsynced(network: NetworkType) -> bool {
+    !matches!(network, NetworkType::Mainnet)
+}
+
 /// How long to wait for the node before treating it as gone and reconnecting.
 const RPC_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -167,6 +173,44 @@ pub struct PeerRow {
     pub protocol_version: u32,
     pub connected_secs: u64,
     pub ibd_peer: bool,
+}
+
+/// Whether `address` (`ip:port`) belongs to a computer outside the local network: not loopback, not a private
+/// (LAN) range, not link-local, and not the carrier-grade NAT range an internet provider uses internally.
+pub fn is_outside_address(address: &str) -> bool {
+    let Ok(socket) = address.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    is_outside_ip(socket.ip())
+}
+
+fn is_outside_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            let carrier_nat = o[0] == 100 && (o[1] & 0xC0) == 64; // 100.64.0.0/10
+            !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || v4.is_documentation()
+                || carrier_nat
+                || o[0] == 0
+                || o[0] >= 240)
+        }
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_outside_ip(IpAddr::V4(v4)),
+            None => {
+                let first = v6.segments()[0];
+                let unique_local = first & 0xfe00 == 0xfc00; // fc00::/7
+                let link_local = first & 0xffc0 == 0xfe80; // fe80::/10
+                !(v6.is_loopback() || v6.is_unspecified() || unique_local || link_local)
+            }
+        },
+    }
+}
+
+/// How many peers connected *in* to us from outside our own network. Only these prove that the node is reachable
+/// from the internet, which is what makes it a public node.
+pub fn outside_inbound_count(peers: &[PeerRow]) -> usize {
+    peers.iter().filter(|p| !p.outbound && is_outside_address(&p.address)).count()
 }
 
 /// One unspent output belonging to the wallet.
@@ -341,13 +385,16 @@ fn spawn_aerod(config: &NodeConfig, state: &Arc<Mutex<NodeState>>) -> Option<Chi
         NetworkType::Testnet => {
             command.arg("--testnet").arg(format!("--netsuffix={}", config.testnet_suffix));
         }
-        // Private test networks have no other miners, so let the node accept locally mined blocks while "unsynced".
         NetworkType::Devnet => {
-            command.arg("--devnet").arg("--enable-unsynced-mining");
+            command.arg("--devnet");
         }
         NetworkType::Simnet => {
-            command.arg("--simnet").arg("--enable-unsynced-mining");
+            command.arg("--simnet");
         }
+    }
+    // Test networks may have no other miners, so let the node accept locally mined blocks while "unsynced".
+    if mines_unsynced(config.network) {
+        command.arg("--enable-unsynced-mining");
     }
     // Keep the node's output, so that if it dies right away the app can say why.
     command.stdin(Stdio::null());
@@ -592,6 +639,28 @@ pub fn params_for(network: NetworkType, testnet_suffix: u32) -> Params {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_only_addresses_outside_the_local_network_count_as_public() {
+        for outside in ["1.1.1.1:16711", "8.8.8.8:1", "[2a00:1450::1]:16711"] {
+            assert!(is_outside_address(outside), "{outside} should be outside");
+        }
+        for local in [
+            "127.0.0.1:16711",
+            "192.168.1.160:16711",
+            "10.0.0.5:16711",
+            "172.16.4.1:16711",
+            "169.254.1.1:16711",
+            "100.64.0.1:16711", // carrier-grade NAT
+            "[::1]:16711",
+            "[fe80::1]:16711",
+            "[fd00::1]:16711",
+            "[::ffff:192.168.1.5]:16711",
+            "not an address",
+        ] {
+            assert!(!is_outside_address(local), "{local} should not count as outside");
+        }
+    }
 
     #[test]
     fn test_port_forwarding_is_read_from_the_node_log() {

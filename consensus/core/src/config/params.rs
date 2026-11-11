@@ -206,6 +206,11 @@ impl BlockrateParams {
         }
     }
 
+    pub const fn with_coinbase_maturity(mut self, coinbase_maturity: u64) -> Self {
+        self.coinbase_maturity = coinbase_maturity;
+        self
+    }
+
     pub const fn increase_max_block_parents(mut self, max_block_parents: u8) -> Self {
         if self.max_block_parents < max_block_parents {
             self.max_block_parents = max_block_parents;
@@ -715,7 +720,8 @@ pub const TESTNET13_PARAMS: Params = Params {
     deflationary_phase_daa_score: u64::MAX,
     pre_deflationary_phase_base_subsidy: 10_000_000,
     halving_interval: Some(500_000_000),
-    blockrate: BlockrateParams::new::<4>(),
+    // Mined rewards are spendable right away on this test network (no coinbase maturity wait).
+    blockrate: BlockrateParams::new::<4>().with_coinbase_maturity(0),
     pre_crescendo_target_time_per_block: Bps::<4>::target_time_per_block(),
     crescendo_activation: ForkActivation::always(),
     dagknight_activation: ForkActivation::always(),
